@@ -1,0 +1,39 @@
+# ZeptoClaw Dockerfile (prebuilt binary)
+# Uses a locally cross-compiled x86_64-unknown-linux-musl binary.
+#
+# Prerequisites (macOS):
+#   brew install filosottile/musl-cross/musl-cross
+#   rustup target add x86_64-unknown-linux-musl
+#
+# Build binary (see CLAUDE.md "Cross-Compilation" section for details):
+#   CARGO_PROFILE_RELEASE_LTO=false \
+#   CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+#   cargo build --release --target x86_64-unknown-linux-musl --bin zeptoclaw
+#
+# Copy binary into workspace root:
+#   cp target/x86_64-unknown-linux-musl/release/zeptoclaw ./zeptoclaw-linux-amd64
+#
+# Build image:
+#   docker buildx build --platform linux/amd64 -t zeptoclaw:latest -f Dockerfile.prebuilt .
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    git \
+    gosu \
+    wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -s /bin/false -d /data zeptoclaw
+
+COPY zeptoclaw-linux-amd64 /usr/local/bin/zeptoclaw
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/zeptoclaw
+
+ENV RUST_LOG=zeptoclaw=info
+
+EXPOSE 8080 9090
+VOLUME /data
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["zeptoclaw", "--help"]

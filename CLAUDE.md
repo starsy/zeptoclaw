@@ -15,8 +15,10 @@ cargo build --release --features android
 cargo build --release --features mqtt
 
 # Cross-compile for linux/amd64 (on Apple Silicon Mac)
-CARGO_PROFILE_RELEASE_LTO=false \
 CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+CARGO_PROFILE_RELEASE_LTO=off \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+CARGO_PROFILE_RELEASE_STRIP=none \
 cargo build --release --target x86_64-unknown-linux-musl --bin zeptoclaw
 
 # Build linux/amd64 Docker image (requires cross-compiled binary above)
@@ -733,16 +735,20 @@ Only set the linker. Do NOT add rustflags here — see "Known Pitfalls" below.
 ### Build the binary
 
 ```bash
-CARGO_PROFILE_RELEASE_LTO=false \
 CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+CARGO_PROFILE_RELEASE_LTO=off \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+CARGO_PROFILE_RELEASE_STRIP=none \
 cargo build --release --target x86_64-unknown-linux-musl --bin zeptoclaw
 ```
 
-`CARGO_PROFILE_RELEASE_LTO=false` is mandatory — it overrides the `lto = true` in
-`[profile.release]` which causes an ICE (Internal Compiler Error) during
-cross-compilation on rustc 1.93.
+Three env vars are required (requires nightly toolchain, see `rust-toolchain.toml`):
+- `CARGO_PROFILE_RELEASE_LTO=off` — fully disables LTO (not just `false`/thin-local); `lto=true` in `[profile.release]` causes silent CGU codegen failures during cross-compilation
+- `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` — overrides `codegen-units=1`; needed alongside `lto=off` to avoid LLVM bitcode-only emission for large CGUs
+- `CARGO_PROFILE_RELEASE_STRIP=none` — prevents macOS `strip` from being invoked on ELF objects
+- Do NOT add `-C save-temps` to rustflags — causes archiver sequencing failures (CGU .o files unavailable when archiver runs)
 
-Output: `target/x86_64-unknown-linux-musl/release/zeptoclaw` (~13 MB, static-pie ELF)
+Output: `target/x86_64-unknown-linux-musl/release/zeptoclaw` (~29 MB with debug info, static-pie ELF)
 
 ### Build the Docker image
 

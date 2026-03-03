@@ -14,6 +14,16 @@ cargo build --release --features android
 # Build with MQTT IoT channel
 cargo build --release --features mqtt
 
+# Cross-compile for linux/amd64 (on Apple Silicon Mac)
+CARGO_PROFILE_RELEASE_LTO=false \
+CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+cargo build --release --target x86_64-unknown-linux-musl --bin zeptoclaw
+
+# Build linux/amd64 Docker image (requires cross-compiled binary above)
+cp target/x86_64-unknown-linux-musl/release/zeptoclaw ./zeptoclaw-linux-amd64
+docker buildx build --platform linux/amd64 -t zeptoclaw:latest -f Dockerfile.prebuilt .
+rm zeptoclaw-linux-amd64
+
 # Run tests
 cargo test
 
@@ -701,6 +711,86 @@ Verified on Apple Silicon (release build):
 - Binary size: ~6MB (stripped, macos-aarch64)
 - Startup time: ~50ms
 - Memory (RSS): ~6MB
+
+## Cross-Compilation (linux/amd64 on Apple Silicon Mac)
+
+### Prerequisites
+
+```bash
+brew install filosottile/musl-cross/musl-cross
+rustup target add x86_64-unknown-linux-musl
+```
+
+### .cargo/config.toml
+
+```toml
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+```
+
+Only set the linker. Do NOT add rustflags here — see "Known Pitfalls" below.
+
+### Build the binary
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=false \
+CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+cargo build --release --target x86_64-unknown-linux-musl --bin zeptoclaw
+```
+
+`CARGO_PROFILE_RELEASE_LTO=false` is mandatory — it overrides the `lto = true` in
+`[profile.release]` which causes an ICE (Internal Compiler Error) during
+cross-compilation on rustc 1.93.
+
+Output: `target/x86_64-unknown-linux-musl/release/zeptoclaw` (~13 MB, static-pie ELF)
+
+### Build the Docker image
+
+```bash
+cp target/x86_64-unknown-linux-musl/release/zeptoclaw ./zeptoclaw-linux-amd64
+docker buildx build --platform linux/amd64 -t zeptoclaw:latest -f Dockerfile.prebuilt .
+rm zeptoclaw-linux-amd64
+```
+
+The binary must be copied to the workspace root because `.dockerignore` excludes `target/`.
+
+### One-liner (build + Docker)
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=false \
+CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+cargo build --release --target x86_64-unknown-linux-musl --bin zeptoclaw \
+&& cp target/x86_64-unknown-linux-musl/release/zeptoclaw ./zeptoclaw-linux-amd64 \
+&& docker buildx build --platform linux/amd64 -t zeptoclaw:latest -f Dockerfile.prebuilt . \
+&& rm zeptoclaw-linux-amd64
+```
+
+### Known Pitfalls (as of rustc 1.93 / 2026-03)
+
+1. **QEMU emulation crashes** — Do NOT use `docker buildx build` with the multi-stage
+   `Dockerfile` (which compiles inside QEMU). Rustc segfaults under QEMU x86_64
+   emulation on ARM64 hosts, even with `GLIBC_TUNABLES` and `RUST_MIN_STACK` workarounds.
+   Always cross-compile natively on macOS and use `Dockerfile.prebuilt`.
+
+2. **LTO causes ICE** — `[profile.release]` has `lto = true`. When cross-compiling
+   to musl, the LTO codegen phase panics with "couldn't open rlib: No such file or
+   directory" at `rustc_codegen_llvm/src/back/lto.rs`. Override with
+   `CARGO_PROFILE_RELEASE_LTO=false`.
+
+3. **Rlibs contain LLVM bitcode** — Rust 1.93 emits LLVM IR bitcode (not native ELF
+   objects) inside rlib archives for cross-compilation targets. The GNU `ld` from
+   `musl-cross` cannot link these ("file format not recognized"). The fix is
+   `CARGO_PROFILE_RELEASE_LTO=false` which makes rustc emit native ELF objects.
+   Do NOT add `-C save-temps`, `-C embed-bitcode=no`, or `-C lto=off` to
+   `rustflags` — these are either ineffective or cause different failures.
+
+4. **`-C save-temps` is harmful** — Was used in earlier QEMU workarounds but causes
+   object format corruption in rlibs. Never include it for native cross-compilation.
+
+5. **Cursor sandbox interference** — When building from within Cursor IDE, the
+   sandbox may redirect `CARGO_TARGET_DIR` to a temp cache directory, causing path
+   mismatches between compilation and linking. If you see "cannot find libXXX.rlib"
+   errors, build from a regular terminal outside Cursor.
 
 ## Common Tasks
 

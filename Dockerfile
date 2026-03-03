@@ -17,6 +17,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Increase rustc stack size for QEMU compatibility on ARM64 hosts
+ENV RUST_MIN_STACK=16777216
+# Disable LTO and single-CGU to avoid QEMU codegen crashes during cross-compilation
+ENV CARGO_PROFILE_RELEASE_LTO=false
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+# Disable AVX/AVX2/AVX512 in glibc so realloc/memcpy use safe paths under QEMU emulation
+ENV GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX512F,-AVX2,-AVX
+
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock* ./
 

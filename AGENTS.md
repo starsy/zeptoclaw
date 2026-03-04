@@ -21,7 +21,7 @@ Project-level guidance for coding agents working in this repository.
 - Channel supervisor: polling (15s) detects dead channels, restarts with 60s cooldown, max 5 restarts
 - Telegram outbound formatting: sends HTML parse mode with `||spoiler||` → `<tg-spoiler>` conversion
 - Discord outbound delivery: supports reply references and thread-create metadata (`discord_thread_*`) in `OutboundMessage`
-- Discord gateway supports optional HTTP CONNECT proxy tunneling via `channels.discord.gateway_proxy` / `ZEPTOCLAW_CHANNELS_DISCORD_GATEWAY_PROXY`
+- Discord gateway supports optional HTTP CONNECT proxy tunneling via standard proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY` and lowercase variants); `NONO_PROXY_TOKEN` is used as proxy auth fallback
 - Cron scheduling hardening: dispatch timeout + exponential error backoff + one-shot delete-after-run only on success
 - Model switching: Telegram `/model` supports per-chat overrides (in-memory + long-term)
 - Persona switching: `/persona` command with presets and custom text, LTM persistence per chat

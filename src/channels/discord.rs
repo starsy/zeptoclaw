@@ -272,6 +272,37 @@ impl DiscordChannel {
         Ok((host.to_string(), port, auth_header))
     }
 
+    fn gateway_proxy_from_env(ws_url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(ws_url).ok()?;
+        let scheme = parsed.scheme();
+        let prefer_https = matches!(scheme, "wss" | "https");
+        let candidates: &[&str] = if prefer_https {
+            &["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        } else {
+            &["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
+        };
+
+        for key in candidates {
+            if let Ok(value) = std::env::var(key) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn nono_proxy_auth_header() -> Option<String> {
+        if let Ok(token) = std::env::var("NONO_PROXY_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                return Some(format!("Proxy-Authorization: Bearer {}\r\n", trimmed));
+            }
+        }
+        None
+    }
+
     fn build_connect_request(
         target_host: &str,
         target_port: u16,
@@ -315,7 +346,10 @@ impl DiscordChannel {
             .port_or_known_default()
             .ok_or_else(|| ZeptoError::Channel("Discord gateway URL missing port".to_string()))?;
 
-        let (proxy_host, proxy_port, proxy_auth_header) = Self::parse_proxy_url(proxy_url)?;
+        let (proxy_host, proxy_port, mut proxy_auth_header) = Self::parse_proxy_url(proxy_url)?;
+        if proxy_auth_header.is_none() {
+            proxy_auth_header = Self::nono_proxy_auth_header();
+        }
         let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
         let mut stream = TcpStream::connect(&proxy_addr).await.map_err(|e| {
             ZeptoError::Channel(format!(
@@ -380,16 +414,10 @@ impl DiscordChannel {
         Ok(ws_stream)
     }
 
-    async fn connect_gateway(
-        ws_url: &str,
-        gateway_proxy: Option<&str>,
-    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        if let Some(proxy_url) = gateway_proxy {
-            let trimmed = proxy_url.trim();
-            if !trimmed.is_empty() {
-                info!("Discord gateway connecting via HTTP CONNECT proxy");
-                return Self::connect_via_http_proxy(ws_url, trimmed).await;
-            }
+    async fn connect_gateway(ws_url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        if let Some(proxy_url) = Self::gateway_proxy_from_env(ws_url) {
+            info!("Discord gateway connecting via HTTP CONNECT proxy from env");
+            return Self::connect_via_http_proxy(ws_url, &proxy_url).await;
         }
 
         let (ws_stream, _) = connect_async(ws_url)
@@ -706,7 +734,6 @@ impl DiscordChannel {
         bus: Arc<MessageBus>,
         allowlist: Vec<String>,
         deny_by_default: bool,
-        gateway_proxy: Option<String>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let mut reconnect_attempt: u32 = 0;
@@ -748,7 +775,7 @@ impl DiscordChannel {
                     info!("Discord gateway shutdown requested");
                     return;
                 }
-                result = Self::connect_gateway(&ws_url, gateway_proxy.as_deref()) => {
+                result = Self::connect_gateway(&ws_url) => {
                     match result {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -1078,7 +1105,6 @@ impl Channel for DiscordChannel {
         let bus = Arc::clone(&self.bus);
         let allow_from = self.config.allow_from.clone();
         let deny_by_default = self.config.deny_by_default;
-        let gateway_proxy = self.config.gateway_proxy.clone();
         tokio::spawn(async move {
             Self::run_gateway_loop(
                 http_client,
@@ -1086,7 +1112,6 @@ impl Channel for DiscordChannel {
                 bus,
                 allow_from,
                 deny_by_default,
-                gateway_proxy,
                 shutdown_rx,
             )
             .await;
@@ -1659,7 +1684,6 @@ mod tests {
         assert!(!config.enabled); // #[serde(default)] -> bool defaults to false
         assert_eq!(config.token, "bot-abc-123");
         assert!(config.allow_from.is_empty());
-        assert!(config.gateway_proxy.is_none());
     }
 
     #[test]
@@ -1674,7 +1698,6 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.token, "tok-full");
         assert_eq!(config.allow_from, vec!["111", "222", "333"]);
-        assert!(config.gateway_proxy.is_none());
     }
 
     #[test]
@@ -1683,7 +1706,6 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.token.is_empty());
         assert!(config.allow_from.is_empty());
-        assert!(config.gateway_proxy.is_none());
     }
 
     // -----------------------------------------------------------------------

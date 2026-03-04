@@ -21,9 +21,15 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tokio_tungstenite::client_async_tls;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, info, warn};
 
 use crate::bus::{InboundMessage, MediaAttachment, MediaType, MessageBus, OutboundMessage};
@@ -54,6 +60,7 @@ const GATEWAY_INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 const DISCORD_CHANNEL_TYPE_GUILD_FORUM: u8 = 15;
 const DISCORD_CHANNEL_TYPE_GUILD_MEDIA: u8 = 16;
+const MAX_PROXY_CONNECT_RESPONSE_BYTES: usize = 8 * 1024;
 
 // ---------------------------------------------------------------------------
 // Gateway payload types (deserialization)
@@ -227,6 +234,168 @@ impl DiscordChannel {
 
         // Append gateway version and encoding query params.
         Ok(format!("{}/?v=10&encoding=json", url))
+    }
+
+    fn parse_proxy_url(proxy_url: &str) -> Result<(String, u16, Option<String>)> {
+        let parsed = reqwest::Url::parse(proxy_url).map_err(|e| {
+            ZeptoError::Config(format!(
+                "Invalid Discord gateway proxy URL '{}': {}",
+                proxy_url, e
+            ))
+        })?;
+
+        if parsed.scheme() != "http" {
+            return Err(ZeptoError::Config(format!(
+                "Discord gateway proxy URL must use http:// scheme, got '{}'",
+                parsed.scheme()
+            )));
+        }
+
+        let host = parsed.host_str().ok_or_else(|| {
+            ZeptoError::Config("Discord gateway proxy URL missing host".to_string())
+        })?;
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            ZeptoError::Config("Discord gateway proxy URL missing port".to_string())
+        })?;
+
+        let auth_header = if parsed.username().is_empty() {
+            None
+        } else {
+            use base64::Engine as _;
+            let username = parsed.username();
+            let password = parsed.password().unwrap_or("");
+            let creds = format!("{}:{}", username, password);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+            Some(format!("Proxy-Authorization: Basic {}\r\n", encoded))
+        };
+
+        Ok((host.to_string(), port, auth_header))
+    }
+
+    fn build_connect_request(
+        target_host: &str,
+        target_port: u16,
+        auth_header: Option<&str>,
+    ) -> String {
+        let mut request = format!(
+            "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n"
+        );
+        if let Some(auth) = auth_header {
+            request.push_str(auth);
+        }
+        request.push_str("\r\n");
+        request
+    }
+
+    fn parse_connect_response_ok(response: &[u8]) -> Result<bool> {
+        let text = std::str::from_utf8(response).map_err(|e| {
+            ZeptoError::Channel(format!(
+                "HTTP CONNECT proxy response is not valid UTF-8: {}",
+                e
+            ))
+        })?;
+        let status_line = text.lines().next().unwrap_or_default();
+        if status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200") {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn connect_via_http_proxy(
+        ws_url: &str,
+        proxy_url: &str,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let ws_parsed = reqwest::Url::parse(ws_url).map_err(|e| {
+            ZeptoError::Channel(format!("Invalid Discord gateway URL '{}': {}", ws_url, e))
+        })?;
+        let target_host = ws_parsed
+            .host_str()
+            .ok_or_else(|| ZeptoError::Channel("Discord gateway URL missing host".to_string()))?;
+        let target_port = ws_parsed
+            .port_or_known_default()
+            .ok_or_else(|| ZeptoError::Channel("Discord gateway URL missing port".to_string()))?;
+
+        let (proxy_host, proxy_port, proxy_auth_header) = Self::parse_proxy_url(proxy_url)?;
+        let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+        let mut stream = TcpStream::connect(&proxy_addr).await.map_err(|e| {
+            ZeptoError::Channel(format!(
+                "Failed to connect to Discord HTTP CONNECT proxy '{}': {}",
+                proxy_addr, e
+            ))
+        })?;
+
+        let connect_request =
+            Self::build_connect_request(target_host, target_port, proxy_auth_header.as_deref());
+        stream
+            .write_all(connect_request.as_bytes())
+            .await
+            .map_err(|e| {
+                ZeptoError::Channel(format!("Failed to write HTTP CONNECT request: {}", e))
+            })?;
+        stream.flush().await.map_err(|e| {
+            ZeptoError::Channel(format!("Failed to flush HTTP CONNECT request: {}", e))
+        })?;
+
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await.map_err(|e| {
+                ZeptoError::Channel(format!("Failed reading HTTP CONNECT proxy response: {}", e))
+            })?;
+            if n == 0 {
+                return Err(ZeptoError::Channel(
+                    "HTTP CONNECT proxy closed before sending response headers".to_string(),
+                ));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > MAX_PROXY_CONNECT_RESPONSE_BYTES {
+                return Err(ZeptoError::Channel(format!(
+                    "HTTP CONNECT proxy response too large (>{} bytes)",
+                    MAX_PROXY_CONNECT_RESPONSE_BYTES
+                )));
+            }
+        }
+
+        if !Self::parse_connect_response_ok(&buf)? {
+            let preview = String::from_utf8_lossy(&buf);
+            let first_line = preview.lines().next().unwrap_or_default();
+            return Err(ZeptoError::Channel(format!(
+                "HTTP CONNECT proxy tunnel failed: {}",
+                first_line
+            )));
+        }
+
+        let request = ws_url.into_client_request().map_err(|e| {
+            ZeptoError::Channel(format!(
+                "Failed to create Discord WebSocket client request for '{}': {}",
+                ws_url, e
+            ))
+        })?;
+        let (ws_stream, _) = client_async_tls(request, stream)
+            .await
+            .map_err(|e| ZeptoError::Channel(format!("Discord WebSocket connect failed: {}", e)))?;
+        Ok(ws_stream)
+    }
+
+    async fn connect_gateway(
+        ws_url: &str,
+        gateway_proxy: Option<&str>,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        if let Some(proxy_url) = gateway_proxy {
+            let trimmed = proxy_url.trim();
+            if !trimmed.is_empty() {
+                info!("Discord gateway connecting via HTTP CONNECT proxy");
+                return Self::connect_via_http_proxy(ws_url, trimmed).await;
+            }
+        }
+
+        let (ws_stream, _) = connect_async(ws_url)
+            .await
+            .map_err(|e| ZeptoError::Channel(format!("Discord WebSocket connect failed: {}", e)))?;
+        Ok(ws_stream)
     }
 
     // -----------------------------------------------------------------------
@@ -537,6 +706,7 @@ impl DiscordChannel {
         bus: Arc<MessageBus>,
         allowlist: Vec<String>,
         deny_by_default: bool,
+        gateway_proxy: Option<String>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let mut reconnect_attempt: u32 = 0;
@@ -570,6 +740,7 @@ impl DiscordChannel {
                     }
                 }
             };
+            info!("Discord gateway URL discovered: {}", ws_url);
 
             // --- WebSocket connect ---
             let ws_stream = tokio::select! {
@@ -577,9 +748,9 @@ impl DiscordChannel {
                     info!("Discord gateway shutdown requested");
                     return;
                 }
-                result = connect_async(&ws_url) => {
+                result = Self::connect_gateway(&ws_url, gateway_proxy.as_deref()) => {
                     match result {
-                        Ok((stream, _)) => stream,
+                        Ok(stream) => stream,
                         Err(e) => {
                             warn!("Discord: WebSocket connect failed: {}", e);
                             let delay = Self::backoff_delay(reconnect_attempt);
@@ -907,6 +1078,7 @@ impl Channel for DiscordChannel {
         let bus = Arc::clone(&self.bus);
         let allow_from = self.config.allow_from.clone();
         let deny_by_default = self.config.deny_by_default;
+        let gateway_proxy = self.config.gateway_proxy.clone();
         tokio::spawn(async move {
             Self::run_gateway_loop(
                 http_client,
@@ -914,6 +1086,7 @@ impl Channel for DiscordChannel {
                 bus,
                 allow_from,
                 deny_by_default,
+                gateway_proxy,
                 shutdown_rx,
             )
             .await;
@@ -1369,6 +1542,41 @@ mod tests {
         assert_eq!(d, Duration::from_secs(MAX_RECONNECT_DELAY_SECS));
     }
 
+    #[test]
+    fn test_parse_proxy_url_http_with_auth() {
+        let (host, port, auth) =
+            DiscordChannel::parse_proxy_url("http://alice:secret@127.0.0.1:8080")
+                .expect("proxy should parse");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
+        assert!(auth.is_some());
+        let auth_line = auth.expect("auth header expected");
+        assert!(auth_line.starts_with("Proxy-Authorization: Basic "));
+    }
+
+    #[test]
+    fn test_parse_proxy_url_rejects_non_http_scheme() {
+        let err = DiscordChannel::parse_proxy_url("https://127.0.0.1:8080")
+            .expect_err("https proxy must be rejected for CONNECT transport");
+        assert!(err
+            .to_string()
+            .contains("Discord gateway proxy URL must use http:// scheme"));
+    }
+
+    #[test]
+    fn test_parse_connect_response_ok() {
+        let resp = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: test\r\n\r\n";
+        let ok = DiscordChannel::parse_connect_response_ok(resp).expect("parse should succeed");
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_parse_connect_response_not_ok() {
+        let resp = b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n";
+        let ok = DiscordChannel::parse_connect_response_ok(resp).expect("parse should succeed");
+        assert!(!ok);
+    }
+
     // -----------------------------------------------------------------------
     // Extra: Identify and heartbeat payload construction
     // -----------------------------------------------------------------------
@@ -1451,6 +1659,7 @@ mod tests {
         assert!(!config.enabled); // #[serde(default)] -> bool defaults to false
         assert_eq!(config.token, "bot-abc-123");
         assert!(config.allow_from.is_empty());
+        assert!(config.gateway_proxy.is_none());
     }
 
     #[test]
@@ -1465,6 +1674,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.token, "tok-full");
         assert_eq!(config.allow_from, vec!["111", "222", "333"]);
+        assert!(config.gateway_proxy.is_none());
     }
 
     #[test]
@@ -1473,6 +1683,7 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.token.is_empty());
         assert!(config.allow_from.is_empty());
+        assert!(config.gateway_proxy.is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -823,6 +823,17 @@ impl Config {
                 channel.enabled = enabled;
             }
         }
+        if let Ok(val) = std::env::var("ZEPTOCLAW_CHANNELS_DISCORD_GATEWAY_PROXY") {
+            let channel = self
+                .channels
+                .discord
+                .get_or_insert_with(DiscordConfig::default);
+            channel.gateway_proxy = if val.trim().is_empty() {
+                None
+            } else {
+                Some(val)
+            };
+        }
 
         // Slack
         if let Ok(val) = std::env::var("ZEPTOCLAW_CHANNELS_SLACK_BOT_TOKEN") {

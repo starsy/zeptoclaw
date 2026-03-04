@@ -941,6 +941,10 @@ pub struct DiscordConfig {
     /// When true, empty `allow_from` rejects all senders (strict mode).
     #[serde(default)]
     pub deny_by_default: bool,
+    /// Optional HTTP CONNECT proxy URL used for Discord Gateway WebSocket.
+    /// Example: "http://127.0.0.1:7890"
+    #[serde(default)]
+    pub gateway_proxy: Option<String>,
 }
 
 /// Slack channel configuration

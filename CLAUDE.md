@@ -437,6 +437,7 @@ Message input channels via `Channel` trait:
 - `TelegramChannel` - Telegram bot integration
 - `SlackChannel` - Slack outbound messaging
 - `DiscordChannel` - Discord Gateway WebSocket + REST API messaging (replies + thread creation)
+- Discord gateway supports optional HTTP CONNECT proxy tunneling via `channels.discord.gateway_proxy`
 - `WebhookChannel` - Generic HTTP POST inbound with optional Bearer auth
 - `WhatsAppChannel` - WhatsApp via whatsmeow-rs bridge (WebSocket JSON protocol)
 - `WhatsAppCloudChannel` - WhatsApp Cloud API (webhook inbound + REST outbound, no bridge)
@@ -583,6 +584,7 @@ Environment variables override config:
 - `ZEPTOCLAW_OAUTH_CLIENT_ID` — OAuth client id (used by `auth login`)
 - `ZEPTOCLAW_PROVIDERS_ANTHROPIC_OAUTH_CLIENT_ID` — provider-specific OAuth client id override
 - `ZEPTOCLAW_CHANNELS_TELEGRAM_BOT_TOKEN`
+- `ZEPTOCLAW_CHANNELS_DISCORD_GATEWAY_PROXY` — optional HTTP CONNECT proxy URL for Discord Gateway WebSocket
 - `ZEPTOCLAW_AGENTS_DEFAULTS_AGENT_TIMEOUT_SECS` — wall-clock timeout for agent runs (default: 300)
 - `ZEPTOCLAW_AGENTS_DEFAULTS_MESSAGE_QUEUE_MODE` — "collect" (default) or "followup"
 - `ZEPTOCLAW_PROVIDERS_RETRY_ENABLED` — enable retry wrapper (default: false)

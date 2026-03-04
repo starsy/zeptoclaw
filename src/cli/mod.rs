@@ -21,6 +21,8 @@ pub mod pair;
 pub mod panel;
 pub mod quota;
 pub mod secrets;
+#[cfg(feature = "panel")]
+pub mod serve;
 pub mod skills;
 pub mod status;
 pub mod template;
@@ -240,6 +242,22 @@ enum Commands {
     Hardware {
         #[command(subcommand)]
         action: HardwareAction,
+    },
+    #[cfg(feature = "panel")]
+    /// Start an OpenAI-compatible API server (no panel UI)
+    Serve {
+        /// Port to listen on
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Bind address
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
+    /// Start MCP server (expose tools to Claude Desktop, VS Code, Cursor)
+    McpServer {
+        /// Listen on HTTP address instead of stdio (e.g., ":3000", "127.0.0.1:3000")
+        #[arg(long)]
+        http: Option<String>,
     },
 }
 
@@ -621,6 +639,13 @@ pub async fn run() -> Result<()> {
         Some(Commands::Hardware { action }) => {
             cmd_hardware(action);
         }
+        #[cfg(feature = "panel")]
+        Some(Commands::Serve { port, bind }) => {
+            serve::cmd_serve(port, bind).await?;
+        }
+        Some(Commands::McpServer { http }) => {
+            cmd_mcp_server(http).await?;
+        }
     }
 
     Ok(())
@@ -694,4 +719,48 @@ fn cmd_hardware(action: HardwareAction) {
             }
         },
     }
+}
+
+/// Start MCP server, exposing registered tools via JSON-RPC 2.0.
+async fn cmd_mcp_server(http: Option<String>) -> Result<()> {
+    use std::sync::Arc;
+
+    use zeptoclaw::bus::MessageBus;
+    use zeptoclaw::config::Config;
+    use zeptoclaw::mcp_server::McpServer;
+
+    // Config::load() performs blocking filesystem I/O; move it off the
+    // async runtime thread to avoid starving other tasks.
+    let config = tokio::task::spawn_blocking(Config::load)
+        .await
+        .map_err(|e| anyhow::anyhow!("Config loader task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {e}"))?;
+    let bus = Arc::new(MessageBus::new());
+
+    let kernel = zeptoclaw::kernel::ZeptoKernel::boot(config, bus, None, None).await?;
+    let kernel = Arc::new(kernel);
+    let server = McpServer::new(kernel);
+
+    match http {
+        Some(addr) => {
+            #[cfg(feature = "panel")]
+            {
+                server.start_http(&addr).await?;
+            }
+            #[cfg(not(feature = "panel"))]
+            {
+                let _ = addr;
+                anyhow::bail!(
+                    "HTTP transport requires the 'panel' feature. \
+                     Build with: cargo build --features panel\n\
+                     Or use stdio transport (default): zeptoclaw mcp-server"
+                );
+            }
+        }
+        None => {
+            server.start_stdio().await?;
+        }
+    }
+
+    Ok(())
 }

@@ -27,6 +27,7 @@ use crate::utils::metrics::MetricsCollector;
 
 use super::budget::TokenBudget;
 use super::context::ContextBuilder;
+use super::tool_call_limit::ToolCallLimitTracker;
 
 /// System prompt sent during the memory flush turn, instructing the LLM to
 /// persist important facts and deduplicate existing long-term memory entries.
@@ -393,6 +394,8 @@ pub struct AgentLoop {
     dry_run: AtomicBool,
     /// Per-session token budget tracker.
     token_budget: Arc<TokenBudget>,
+    /// Per-agent-run tool call limit tracker.
+    tool_call_limit: ToolCallLimitTracker,
     /// Tool approval gate for policy-based tool gating.
     approval_gate: Arc<ApprovalGate>,
     /// Agent mode for category-based tool enforcement.
@@ -472,6 +475,7 @@ impl AgentLoop {
     pub fn new(config: Config, session_manager: SessionManager, bus: Arc<MessageBus>) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         let token_budget = Arc::new(TokenBudget::new(config.agents.defaults.token_budget));
+        let tool_call_limit = ToolCallLimitTracker::new(config.agents.defaults.max_tool_calls);
         let approval_gate = Arc::new(ApprovalGate::new(config.approval.clone()));
         let agent_mode = config.agent_mode.resolve();
         let safety_layer = if config.safety.enabled {
@@ -508,6 +512,7 @@ impl AgentLoop {
             streaming: AtomicBool::new(false),
             dry_run: AtomicBool::new(false),
             token_budget,
+            tool_call_limit,
             approval_gate,
             agent_mode,
             safety_layer,
@@ -538,6 +543,7 @@ impl AgentLoop {
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         let token_budget = Arc::new(TokenBudget::new(config.agents.defaults.token_budget));
+        let tool_call_limit = ToolCallLimitTracker::new(config.agents.defaults.max_tool_calls);
         let approval_gate = Arc::new(ApprovalGate::new(config.approval.clone()));
         let agent_mode = config.agent_mode.resolve();
         let safety_layer = if config.safety.enabled {
@@ -574,6 +580,7 @@ impl AgentLoop {
             streaming: AtomicBool::new(false),
             dry_run: AtomicBool::new(false),
             token_budget,
+            tool_call_limit,
             approval_gate,
             agent_mode,
             safety_layer,
@@ -786,6 +793,11 @@ impl AgentLoop {
         let session_lock = self.session_lock_for(&msg.session_key).await;
         let _session_guard = session_lock.lock().await;
 
+        // Reset per-run counters so limits apply to each process_message call
+        // independently, not across the lifetime of the AgentLoop struct.
+        self.tool_call_limit.reset();
+        self.token_budget.reset();
+
         // Tiered inbound injection scanning: block untrusted channels, warn others.
         // Runs before any LLM call so injected payloads never reach the model.
         if self.config.safety.enabled && self.config.safety.injection_check_enabled {
@@ -997,11 +1009,38 @@ impl AgentLoop {
         while response.has_tool_calls() && iteration < max_iterations {
             iteration += 1;
             debug!("Tool iteration {} of {}", iteration, max_iterations);
+
+            // Enforce tool call limit BEFORE recording metrics or adding
+            // the assistant message to the session. This ensures max_tool_calls=0
+            // never writes an orphaned tool-call message, and partial truncation
+            // keeps the transcript consistent (only executed calls are recorded).
+            if self.tool_call_limit.is_exceeded() {
+                info!(
+                    count = self.tool_call_limit.count(),
+                    limit = ?self.tool_call_limit.limit(),
+                    "Tool call limit already reached, skipping tool execution"
+                );
+                break;
+            }
+            // Truncate batch to remaining budget so we never overshoot.
+            if let Some(remaining) = self.tool_call_limit.remaining() {
+                let allowed = remaining as usize;
+                if allowed < response.tool_calls.len() {
+                    info!(
+                        batch_size = response.tool_calls.len(),
+                        remaining = allowed,
+                        "Truncating tool call batch to remaining budget"
+                    );
+                    response.tool_calls.truncate(allowed);
+                }
+            }
+
+            // Record metrics AFTER truncation so counts reflect actual execution.
             if let Some(metrics) = usage_metrics.as_ref() {
                 metrics.record_tool_calls(response.tool_calls.len() as u64);
             }
 
-            // Add assistant message with tool calls
+            // Add assistant message with tool calls (post-truncation).
             let mut assistant_msg = Message::assistant(&response.content);
             assistant_msg.tool_calls = Some(
                 response
@@ -1288,6 +1327,53 @@ impl AgentLoop {
                 session.add_message(Message::tool_result(id, result));
             }
 
+            // Increment tool call counter after execution.
+            self.tool_call_limit
+                .increment(response.tool_calls.len() as u32);
+            // If the limit is now hit, make one final LLM call WITHOUT tools
+            // so the model can synthesize the tool results into a proper answer
+            // instead of returning the stale tool-call stub content.
+            if self.tool_call_limit.is_exceeded() {
+                info!(
+                    count = self.tool_call_limit.count(),
+                    limit = ?self.tool_call_limit.limit(),
+                    "Tool call limit reached, making final synthesis call"
+                );
+                // Respect token budget — skip the synthesis call if already over.
+                if self.token_budget.is_exceeded() {
+                    info!(budget = %self.token_budget.summary(), "Token budget also exceeded, skipping synthesis call");
+                    response.content =
+                        "Tool call limit reached. Token budget exceeded.".to_string();
+                    break;
+                }
+                let messages: Vec<_> = self
+                    .context_builder
+                    .build_messages_with_memory_override(
+                        &session.messages,
+                        "",
+                        memory_override.as_deref(),
+                    )
+                    .into_iter()
+                    .filter(|m| !(m.role == Role::User && m.content.is_empty()))
+                    .collect();
+                response = provider
+                    .chat(messages, vec![], model, options.clone())
+                    .await?;
+                if let (Some(metrics), Some(usage)) =
+                    (usage_metrics.as_ref(), response.usage.as_ref())
+                {
+                    metrics
+                        .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                }
+                if let Some(usage) = response.usage.as_ref() {
+                    metrics_collector
+                        .record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                    self.token_budget
+                        .record(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                }
+                break;
+            }
+
             if let Some(guard) = loop_guard.as_mut() {
                 if check_loop_guard(guard, &response.tool_calls, &mut session) {
                     response.content =
@@ -1371,6 +1457,11 @@ impl AgentLoop {
         // Acquire per-session lock
         let session_lock = self.session_lock_for(&msg.session_key).await;
         let _session_guard = session_lock.lock().await;
+
+        // Reset per-run counters so limits apply to each process_message call
+        // independently, not across the lifetime of the AgentLoop struct.
+        self.tool_call_limit.reset();
+        self.token_budget.reset();
 
         // Tiered inbound injection scanning (streaming path).
         if self.config.safety.enabled && self.config.safety.injection_check_enabled {
@@ -1501,6 +1592,7 @@ impl AgentLoop {
         // Tool loop (non-streaming)
         let max_iterations = self.config.agents.defaults.max_tool_iterations;
         let mut iteration = 0;
+        let mut tool_limit_hit = false;
         let mut chain_tracker = crate::safety::chain_alert::ChainTracker::new();
         let mut loop_guard = if self.config.agents.defaults.loop_guard.enabled {
             Some(LoopGuard::new(
@@ -1513,6 +1605,30 @@ impl AgentLoop {
         while response.has_tool_calls() && iteration < max_iterations {
             iteration += 1;
 
+            // Enforce tool call limit BEFORE adding assistant message to session
+            // (streaming path). Same rationale as non-streaming: avoids orphaned
+            // tool-call messages and keeps transcript consistent.
+            if self.tool_call_limit.is_exceeded() {
+                info!(
+                    count = self.tool_call_limit.count(),
+                    limit = ?self.tool_call_limit.limit(),
+                    "Tool call limit already reached, skipping streaming tool execution"
+                );
+                break;
+            }
+            if let Some(remaining) = self.tool_call_limit.remaining() {
+                let allowed = remaining as usize;
+                if allowed < response.tool_calls.len() {
+                    info!(
+                        batch_size = response.tool_calls.len(),
+                        remaining = allowed,
+                        "Truncating streaming tool call batch to remaining budget"
+                    );
+                    response.tool_calls.truncate(allowed);
+                }
+            }
+
+            // Add assistant message with tool calls (post-truncation).
             let mut assistant_msg = Message::assistant(&response.content);
             assistant_msg.tool_calls = Some(
                 response
@@ -1763,6 +1879,24 @@ impl AgentLoop {
                 session.add_message(Message::tool_result(id, result));
             }
 
+            // Increment tool call counter after execution.
+            self.tool_call_limit
+                .increment(response.tool_calls.len() as u32);
+            // If the limit is now hit, clear tool_calls so the post-loop code
+            // enters the streaming final call branch, which re-issues the
+            // conversation (with tool results in session) as a proper streamed
+            // response instead of returning the stale tool-call stub.
+            if self.tool_call_limit.is_exceeded() {
+                info!(
+                    count = self.tool_call_limit.count(),
+                    limit = ?self.tool_call_limit.limit(),
+                    "Tool call limit reached, proceeding to final streaming synthesis"
+                );
+                tool_limit_hit = true;
+                response.tool_calls.clear();
+                break;
+            }
+
             if let Some(guard) = loop_guard.as_mut() {
                 if check_loop_guard(guard, &response.tool_calls, &mut session) {
                     response.content =
@@ -1813,7 +1947,9 @@ impl AgentLoop {
 
         // Final call: if no more tool calls, use streaming
         if !response.has_tool_calls() {
-            // Re-issue the final call via chat_stream
+            // Re-issue the final call via chat_stream.
+            // If the tool call limit was hit, pass empty tools so the model
+            // cannot emit further tool calls after the cap was enforced.
             let messages: Vec<_> = self
                 .context_builder
                 .build_messages_with_memory_override(
@@ -1825,7 +1961,9 @@ impl AgentLoop {
                 .filter(|m| !(m.role == Role::User && m.content.is_empty()))
                 .collect();
 
-            let tool_definitions = {
+            let tool_definitions = if tool_limit_hit {
+                vec![]
+            } else {
                 let tools = self.tools.read().await;
                 tools.definitions_with_options(self.config.agents.defaults.compact_tools)
             };

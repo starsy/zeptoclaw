@@ -172,6 +172,7 @@ impl ZeptoKernel {
             cron_service,
             memory_searcher,
             shared_ltm: ltm.clone(),
+            template: template.cloned(),
         };
         let mcp_clients =
             registrar::register_all_tools(&mut tools, &config, &filter, &deps).await?;

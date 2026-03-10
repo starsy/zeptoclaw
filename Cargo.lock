@@ -7002,7 +7002,7 @@ dependencies = [
 
 [[package]]
 name = "zeptoclaw"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aho-corasick",
  "anyhow",

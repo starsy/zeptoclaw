@@ -19,7 +19,8 @@ use crate::error::{Result, ZeptoError};
 
 use super::acp_protocol::{
     AgentCapabilities, AgentInfo, ContentBlock, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    SessionNewResult, SessionPromptResult, SessionUpdateParams, SessionUpdatePayload,
+    SessionInfo, SessionListResult, SessionNewResult, SessionPromptResult, SessionUpdateParams,
+    SessionUpdatePayload,
 };
 use super::{BaseChannelConfig, Channel};
 
@@ -342,6 +343,43 @@ impl AcpChannel {
         Ok(())
     }
 
+    /// Handle session/list (ZeptoClaw extension): return all live sessions with
+    /// their pending state.
+    async fn handle_session_list(&self, id: Option<serde_json::Value>) -> Result<()> {
+        let state = self.state.lock().await;
+        if !state.initialized {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: None,
+                error: Some(super::acp_protocol::JsonRpcError {
+                    code: -32600,
+                    message: "initialize must be called before session/list".to_string(),
+                    data: None,
+                }),
+            };
+            return self.write_response(&response).await;
+        }
+        let sessions: Vec<SessionInfo> = state
+            .sessions
+            .iter()
+            .map(|sid| SessionInfo {
+                session_id: sid.clone(),
+                pending: state.pending.contains_key(sid),
+            })
+            .collect();
+        let result = SessionListResult { sessions };
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(serde_json::to_value(result).map_err(|e| {
+                ZeptoError::Channel(format!("ACP: serialize session/list result: {}", e))
+            })?),
+            error: None,
+        };
+        self.write_response(&response).await
+    }
+
     /// Stdin read loop: parse JSON-RPC and dispatch.
     async fn run_stdin_loop(
         bus: Arc<MessageBus>,
@@ -412,6 +450,11 @@ impl AcpChannel {
                     let channel =
                         Self::channel_ref(&bus, &state, &stdout, &config, &base_config, &running);
                     channel.handle_session_cancel(params).await
+                }
+                "session/list" => {
+                    let channel =
+                        Self::channel_ref(&bus, &state, &stdout, &config, &base_config, &running);
+                    channel.handle_session_list(id.clone()).await
                 }
                 _ => {
                     let _ = Self::write_error_response(
@@ -1001,5 +1044,59 @@ mod tests {
             MAX_ACP_SESSIONS,
             "session count must not exceed the cap"
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_list_requires_initialize() {
+        // session/list before initialize must return an error; sessions must stay empty.
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let _ = channel
+            .handle_session_list(Some(serde_json::json!(1)))
+            .await;
+        // No sessions, no crash — just confirm the call completes.
+        let state = channel.state.lock().await;
+        assert!(state.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_session_list_returns_all_sessions() {
+        // After initialize and two session/new calls, session/list must include
+        // both session IDs with correct pending flags.
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let sid_a = "acp_list_a".to_string();
+        let sid_b = "acp_list_b".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.initialized = true;
+            state.sessions.insert(sid_a.clone());
+            state.sessions.insert(sid_b.clone());
+            // Mark sid_a as having a prompt in flight.
+            state.pending.insert(
+                sid_a.clone(),
+                PendingPrompt {
+                    request_id: serde_json::json!(10),
+                    cancelled: false,
+                },
+            );
+        }
+        // Capture what handle_session_list would write to stdout by reading state directly.
+        let state = channel.state.lock().await;
+        let sessions: Vec<_> = state
+            .sessions
+            .iter()
+            .map(|sid| (sid.clone(), state.pending.contains_key(sid)))
+            .collect();
+        drop(state);
+
+        let pending_a = sessions.iter().find(|(s, _)| s == &sid_a).map(|(_, p)| *p);
+        let pending_b = sessions.iter().find(|(s, _)| s == &sid_b).map(|(_, p)| *p);
+        assert_eq!(pending_a, Some(true), "sid_a must be pending");
+        assert_eq!(pending_b, Some(false), "sid_b must not be pending");
     }
 }

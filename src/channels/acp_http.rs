@@ -36,8 +36,8 @@ use crate::error::{Result, ZeptoError};
 
 use super::acp_protocol::{
     AgentCapabilities, AgentInfo, ContentBlock, InitializeResult, JsonRpcRequest,
-    PromptContentBlock, SessionNewResult, SessionPromptResult, SessionUpdateParams,
-    SessionUpdatePayload,
+    PromptContentBlock, SessionInfo, SessionListResult, SessionNewResult, SessionPromptResult,
+    SessionUpdateParams, SessionUpdatePayload,
 };
 use super::{BaseChannelConfig, Channel};
 
@@ -375,6 +375,35 @@ impl AcpHttpChannel {
         "{}".to_string()
     }
 
+    /// Handle session/list (ZeptoClaw extension): return all live sessions with
+    /// their pending state as a synchronous JSON response.
+    async fn do_session_list(
+        state: &Arc<Mutex<AcpHttpState>>,
+        id: Option<serde_json::Value>,
+    ) -> String {
+        let st = state.lock().await;
+        if !st.initialized {
+            return Self::json_rpc_error(
+                id,
+                -32600,
+                "initialize must be called before session/list",
+            );
+        }
+        let sessions: Vec<SessionInfo> = st
+            .sessions
+            .iter()
+            .map(|sid| SessionInfo {
+                session_id: sid.clone(),
+                pending: st.pending.contains_key(sid),
+            })
+            .collect();
+        let result = SessionListResult { sessions };
+        match serde_json::to_value(result) {
+            Ok(v) => Self::json_rpc_result(id, v),
+            Err(e) => Self::json_rpc_error(id, -32603, &format!("serialize error: {}", e)),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // session/prompt: validation + bus publish, returns oneshot receiver
     // -------------------------------------------------------------------------
@@ -685,6 +714,11 @@ impl AcpHttpChannel {
             }
             "session/cancel" => {
                 let body = Self::do_session_cancel(&state, &base_config, params).await;
+                let resp = Self::http_200(&body);
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+            "session/list" => {
+                let body = Self::do_session_list(&state, id).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
@@ -1135,5 +1169,46 @@ mod tests {
         let resp = AcpHttpChannel::http_200(body);
         assert!(resp.contains(&format!("Content-Length: {}", body.len())));
         assert!(resp.ends_with(body));
+    }
+
+    #[tokio::test]
+    async fn test_session_list_requires_initialize() {
+        let ch = make_channel();
+        let body = AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1))).await;
+        assert!(
+            body.contains("-32600"),
+            "session/list before initialize must return -32600"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_list_empty() {
+        let ch = make_channel();
+        ch.state.lock().await.initialized = true;
+        let body = AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1))).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["sessions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_session_list_shows_sessions_with_pending_flag() {
+        let ch = make_channel();
+        let sid_a = "acph_list_a".to_string();
+        let sid_b = "acph_list_b".to_string();
+        {
+            let mut st = ch.state.lock().await;
+            st.initialized = true;
+            st.sessions.insert(sid_a.clone());
+            st.sessions.insert(sid_b.clone());
+            st.pending
+                .insert(sid_a.clone(), PendingPrompt { cancelled: false });
+        }
+        let body = AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1))).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let sessions = v["result"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let find = |sid: &str| sessions.iter().find(|s| s["sessionId"] == sid).cloned();
+        assert_eq!(find(&sid_a).unwrap()["pending"], true);
+        assert_eq!(find(&sid_b).unwrap()["pending"], false);
     }
 }

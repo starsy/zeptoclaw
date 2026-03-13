@@ -1,6 +1,7 @@
 //! ACP (Agent Client Protocol) JSON-RPC and method types.
 //!
-//! Minimal set for initialize, session/new, session/prompt, session/cancel, session/update.
+//! Standard methods: initialize, session/new, session/prompt, session/cancel, session/update.
+//! ZeptoClaw extensions: session/list.
 //! See https://agentclientprotocol.com/protocol/overview
 
 use serde::{Deserialize, Serialize};
@@ -140,6 +141,24 @@ pub enum PromptContentBlock {
 pub struct SessionPromptResult {
     #[serde(rename = "stopReason")]
     pub stop_reason: String,
+}
+
+// --- session/list (ZeptoClaw extension) ---
+
+/// session/list result: snapshot of all live sessions on this transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListResult {
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// Per-session metadata returned by session/list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// The session identifier.
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// Whether a session/prompt is currently in flight for this session.
+    pub pending: bool,
 }
 
 // --- session/cancel (notification) ---

@@ -287,7 +287,7 @@ Allowlist/deny is applied via `BaseChannelConfig` built from `allow_from` and `d
 - **No streaming:** The full agent reply is sent in one `session/update`. Streaming would require either multiple `session/update` notifications or a different update type and client support.
 - **HTTP transport: no persistent connection between prompts:** The HTTP channel holds the TCP connection open only for the duration of a single `session/prompt`; proactive messages (from cron, spawned tasks) cannot be delivered to the client because there is no long-lived SSE subscription separate from the request.
 - **Prompt content:** `text` and `resource_link` blocks are used (per spec, both MUST be supported). `image`, `audio`, and embedded `resource` blocks are silently ignored; the agent never receives them.
-- **No loadSession:** We always report `load_session: false`; session persistence would require additional protocol and storage design.
+- **No loadSession:** We always report `loadSession: false`; session persistence would require additional protocol and storage design.
 
 ---
 
@@ -306,7 +306,7 @@ The following are candidate improvements and extensions, not commitments.
 - **Streaming replies:** Emit multiple `session/update` notifications as the agent produces tokens or segments, instead of a single update at end of turn. Requires agent-loop support for streaming callbacks and a clear contract for chunk boundaries.
 - **Rich prompt content:** Support `image` and `resource` content blocks in `session/prompt` (e.g. pass URLs or inline data to the agent, or integrate with client filesystem if we add those callbacks).
 - **Tool call and tool result updates:** Send `session/update` messages that represent tool invocations and results (e.g. `tool_use` / `tool_result`-style blocks) so the client can show structured progress.
-- **loadSession:** If the spec stabilizes session loading, implement optional persistence of session state (e.g. in `~/.zeptoclaw`) and advertise `load_session: true` when enabled; handle client requests to restore a session.
+- **loadSession:** If the spec stabilizes session loading, implement optional persistence of session state (e.g. in `~/.zeptoclaw`) and advertise `loadSession: true` when enabled; handle client requests to restore a session.
 
 ### 8.3 Client callbacks (optional)
 

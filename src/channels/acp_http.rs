@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info};
 
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
@@ -141,6 +142,9 @@ pub struct AcpHttpChannel {
     /// Handle to the spawned accept-loop task; held so `stop()` can abort and
     /// await it, ensuring the TcpListener is released before returning.
     accept_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Tracks in-flight connection handler tasks so `stop()` can abort and
+    /// await them all, preventing handlers from outliving the channel.
+    conn_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl AcpHttpChannel {
@@ -159,6 +163,7 @@ impl AcpHttpChannel {
             state: Arc::new(Mutex::new(AcpHttpState::new())),
             pending_http: Arc::new(Mutex::new(HashMap::new())),
             accept_handle: None,
+            conn_tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
 
@@ -362,11 +367,14 @@ impl AcpHttpChannel {
     async fn do_session_cancel(
         state: &Arc<Mutex<AcpHttpState>>,
         base_config: &BaseChannelConfig,
+        id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
     ) -> String {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
-            // Notifications have no id; still return an empty 200 body.
-            return "{}".to_string();
+            return match id {
+                Some(_) => Self::json_rpc_error(id, -32000, "Unauthorized"),
+                None => "{}".to_string(),
+            };
         }
         if let Some(p) = params.and_then(|p| {
             serde_json::from_value::<super::acp_protocol::SessionCancelParams>(p).ok()
@@ -377,7 +385,12 @@ impl AcpHttpChannel {
                 debug!(session_id = %p.session_id, "ACP-HTTP: marked prompt as cancelled");
             }
         }
-        "{}".to_string()
+        // For requests (id present) return a proper JSON-RPC result so callers
+        // can correlate the response; for notifications return an empty 200 body.
+        match id {
+            Some(_) => Self::json_rpc_result(id, serde_json::json!({})),
+            None => "{}".to_string(),
+        }
     }
 
     /// Handle session/list: return all live sessions with per-session metadata.
@@ -760,7 +773,7 @@ impl AcpHttpChannel {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
             "session/cancel" => {
-                let body = Self::do_session_cancel(&state, &base_config, params).await;
+                let body = Self::do_session_cancel(&state, &base_config, id, params).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
@@ -829,6 +842,7 @@ impl AcpHttpChannel {
         state: Arc<Mutex<AcpHttpState>>,
         pending_http: PromptMap,
         running: Arc<AtomicBool>,
+        conn_tasks: Arc<Mutex<JoinSet<()>>>,
     ) {
         info!(
             "ACP-HTTP: listening on {}:{}",
@@ -844,7 +858,7 @@ impl AcpHttpChannel {
                     let bus = Arc::clone(&bus);
                     let state = Arc::clone(&state);
                     let pending_http = Arc::clone(&pending_http);
-                    tokio::spawn(async move {
+                    conn_tasks.lock().await.spawn(async move {
                         Self::handle_connection(
                             stream,
                             config,
@@ -899,6 +913,7 @@ impl Channel for AcpHttpChannel {
         let state = Arc::clone(&self.state);
         let pending_http = Arc::clone(&self.pending_http);
         let running = Arc::clone(&self.running);
+        let conn_tasks = Arc::clone(&self.conn_tasks);
 
         let handle = tokio::spawn(async move {
             Self::run_accept_loop(
@@ -910,6 +925,7 @@ impl Channel for AcpHttpChannel {
                 state,
                 pending_http,
                 running,
+                conn_tasks,
             )
             .await;
         });
@@ -935,6 +951,13 @@ impl Channel for AcpHttpChannel {
         if let Some(handle) = self.accept_handle.take() {
             handle.abort();
             let _ = handle.await;
+        }
+        // Abort and drain all in-flight connection handler tasks so they do not
+        // outlive the channel after stop() returns.
+        {
+            let mut tasks = self.conn_tasks.lock().await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
         }
         Ok(())
     }

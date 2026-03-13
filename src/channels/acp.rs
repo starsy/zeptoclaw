@@ -370,28 +370,70 @@ impl AcpChannel {
 
     /// Handle session/cancel: mark pending prompt as cancelled for that session.
     ///
-    /// This is a notification (no id), so we must never return Err (which would
-    /// cause the dispatch loop to emit a -32603 response to a notification — a
-    /// spec violation). Invalid params and unauthorized requests are silently
-    /// ignored per the JSON-RPC 2.0 spec for notifications.
-    async fn handle_session_cancel(&self, params: Option<serde_json::Value>) -> Result<()> {
+    /// Accepts both notifications (id = None) and requests (id = Some). For
+    /// requests a JSON-RPC result is written back so the caller can correlate
+    /// the response. For notifications nothing is written (per spec). Invalid
+    /// params and unauthorized requests produce no output on the notification
+    /// path; on the request path an error response is sent.
+    async fn handle_session_cancel(
+        &self,
+        id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
+    ) -> Result<()> {
         if !self.is_allowed(ACP_SENDER_ID) {
+            if let Some(ref req_id) = id {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(req_id.clone()),
+                    result: None,
+                    error: Some(super::acp_protocol::JsonRpcError {
+                        code: -32000,
+                        message: "Unauthorized".to_string(),
+                        data: None,
+                    }),
+                };
+                return self.write_response(&response).await;
+            }
             return Ok(());
         }
         let params = match params.and_then(|p| {
             serde_json::from_value::<super::acp_protocol::SessionCancelParams>(p).ok()
         }) {
             Some(p) => p,
-            None => return Ok(()),
+            None => {
+                if let Some(ref req_id) = id {
+                    let response = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(req_id.clone()),
+                        result: None,
+                        error: Some(super::acp_protocol::JsonRpcError {
+                            code: -32602,
+                            message: "Invalid params: sessionId required".to_string(),
+                            data: None,
+                        }),
+                    };
+                    return self.write_response(&response).await;
+                }
+                return Ok(());
+            }
         };
         let mut state = self.state.lock().await;
         if !state.sessions.contains_key(&params.session_id) {
             debug!(session_id = %params.session_id, "ACP: session/cancel for unknown session, ignoring");
-            return Ok(());
-        }
-        if let Some(pending) = state.pending.get_mut(&params.session_id) {
+        } else if let Some(pending) = state.pending.get_mut(&params.session_id) {
             pending.cancelled = true;
             debug!(session_id = %params.session_id, "ACP: marked prompt as cancelled");
+        }
+        // Send a result for requests; stay silent for notifications.
+        if let Some(req_id) = id {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(req_id),
+                result: Some(serde_json::json!({})),
+                error: None,
+            };
+            drop(state);
+            return self.write_response(&response).await;
         }
         Ok(())
     }
@@ -520,17 +562,9 @@ impl AcpChannel {
                 "initialize" | "session/new" | "session/prompt" | "session/list"
                     if id.is_none() =>
                 {
-                    // Notifications (missing id) are not valid for request-only
-                    // methods. Return an error and skip handler invocation to avoid
-                    // queuing work that can never be correlated to a response.
-                    let _ = Self::write_error_response(
-                        &stdout,
-                        None,
-                        -32600,
-                        "Invalid Request: notifications are not supported for this method"
-                            .to_string(),
-                    )
-                    .await;
+                    // Notifications (missing id) are not valid for request-only methods.
+                    // Silently ignore — writing an error response to a notification would
+                    // itself be a JSON-RPC 2.0 spec violation.
                     Ok(())
                 }
                 "initialize" => {
@@ -551,7 +585,7 @@ impl AcpChannel {
                 "session/cancel" => {
                     let channel =
                         Self::channel_ref(&bus, &state, &stdout, &config, &base_config, &running);
-                    channel.handle_session_cancel(params).await
+                    channel.handle_session_cancel(id.clone(), params).await
                 }
                 "session/list" => {
                     let channel =
@@ -772,10 +806,16 @@ impl Channel for AcpChannel {
 
     async fn stop(&mut self) -> Result<()> {
         self.running.store(false, Ordering::SeqCst);
-        // Abort the background stdin-loop task so stop() takes effect immediately
-        // rather than waiting for the blocked next_line() call to yield.
+        // Give the stdin loop a short window to flush orphan prompts via its
+        // drain path, then fall back to a hard abort so stop() never blocks.
         if let Some(handle) = self.stdio_handle.take() {
-            handle.abort();
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+            }
         }
         Ok(())
     }
@@ -1090,7 +1130,7 @@ mod tests {
             );
         }
         let params = serde_json::json!({"sessionId": "acp_nonexistent"});
-        let result = channel.handle_session_cancel(Some(params)).await;
+        let result = channel.handle_session_cancel(None, Some(params)).await;
         assert!(result.is_ok());
         let state = channel.state.lock().await;
         let pending = state

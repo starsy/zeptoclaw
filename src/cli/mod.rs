@@ -780,13 +780,14 @@ async fn cmd_acp() -> Result<()> {
 
     // run_stdio() blocks until stdin closes — keeps the process alive for the
     // full session rather than returning immediately like start() would.
-    channel.run_stdio().await?;
+    // Capture the result so teardown always runs on both success and error paths.
+    let res = channel.run_stdio().await;
 
     agent.stop();
     agent_handle.abort();
     dispatch_handle.abort();
 
-    Ok(())
+    Ok(res?)
 }
 
 /// Display version information

@@ -774,13 +774,10 @@ fn e2e_live() -> bool {
 }
 
 /// Run `acpx --agent 'zeptoclaw acp' --format json --approve-all exec <prompt>`
-/// and return the parsed NDJSON event lines.
+/// and return the parsed NDJSON event lines, or `None` if `acpx` is not found.
 #[cfg(test)]
-fn run_acpx_exec(prompt: &str) -> Vec<serde_json::Value> {
-    let acpx = match acpx_bin() {
-        Some(p) => p,
-        None => return vec![],
-    };
+fn run_acpx_exec(prompt: &str) -> Option<Vec<serde_json::Value>> {
+    let acpx = acpx_bin()?;
     let agent_cmd = format!("{} acp", bin());
     let output = std::process::Command::new(&acpx)
         .args([
@@ -803,11 +800,13 @@ fn run_acpx_exec(prompt: &str) -> Vec<serde_json::Value> {
         .output()
         .expect("failed to run acpx");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    Some(
+        stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+    )
 }
 
 /// acpx exec must complete with a non-empty text response.
@@ -817,7 +816,10 @@ fn test_acpx_exec_basic_prompt() {
         eprintln!("Skipping: set ZEPTOCLAW_E2E_LIVE=1 to run");
         return;
     }
-    let events = run_acpx_exec("reply with exactly three words: ONE TWO THREE");
+    let Some(events) = run_acpx_exec("reply with exactly three words: ONE TWO THREE") else {
+        eprintln!("acpx not found; skipping");
+        return;
+    };
     assert!(
         !events.is_empty(),
         "acpx exec must produce at least one JSON event"
@@ -845,7 +847,10 @@ fn test_acpx_exec_produces_session_update_events() {
         eprintln!("Skipping: set ZEPTOCLAW_E2E_LIVE=1 to run");
         return;
     }
-    let events = run_acpx_exec("say hello");
+    let Some(events) = run_acpx_exec("say hello") else {
+        eprintln!("acpx not found; skipping");
+        return;
+    };
     assert!(!events.is_empty(), "must produce events");
     // At least one event must carry a non-empty text payload in the
     // session/update notification (params.update.content.text in the raw
@@ -869,7 +874,10 @@ fn test_acpx_exec_ends_with_end_turn() {
         eprintln!("Skipping: set ZEPTOCLAW_E2E_LIVE=1 to run");
         return;
     }
-    let events = run_acpx_exec("say: DONE");
+    let Some(events) = run_acpx_exec("say: DONE") else {
+        eprintln!("acpx not found; skipping");
+        return;
+    };
     assert!(
         !events.is_empty(),
         "acpx exec must complete and produce events"

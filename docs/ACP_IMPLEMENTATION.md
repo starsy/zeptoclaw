@@ -268,6 +268,7 @@ The following are candidate improvements and extensions, not commitments.
 
 - **Persistent SSE subscription:** Add a `GET /acp/events?session=<id>` endpoint so the HTTP client can maintain a long-lived event stream and receive proactive agent messages (from cron, spawned tasks) between `session/prompt` turns.
 - **WebSocket transport:** Optional alternative to raw SSE for clients that prefer full-duplex framing.
+- **Centralized gateway HTTP server:** Currently each HTTP-capable channel (webhook, WhatsApp Cloud, ACP HTTP) owns its own `TcpListener` on a dedicated port. A future `gateway-http` feature could introduce a shared axum server on `gateway.host:gateway.port` and a companion `HttpChannel` trait (`mount_path()` + `http_router() -> axum::Router`). Channels that implement `HttpChannel` would contribute routes to the shared server instead of binding their own port — matching the architecture OpenClaw uses. This simplifies firewall/proxy configuration (one port to expose) and enables shared middleware (rate limiting, CORS, auth). The `gateway-http` feature would be implied by the existing `panel` feature so that the axum dependency remains opt-in.
 
 ### 8.2 Protocol and capabilities
 

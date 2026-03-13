@@ -80,7 +80,7 @@ pub struct AgentCapabilities {
     pub load_session: Option<bool>,
     #[serde(rename = "promptCapabilities", skip_serializing_if = "Option::is_none")]
     pub prompt_capabilities: Option<serde_json::Value>,
-    #[serde(rename = "mcpCapabilities", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mcp", skip_serializing_if = "Option::is_none")]
     pub mcp_capabilities: Option<serde_json::Value>,
     #[serde(
         rename = "sessionCapabilities",
@@ -143,12 +143,24 @@ pub struct SessionPromptResult {
     pub stop_reason: String,
 }
 
-// --- session/list (ZeptoClaw extension) ---
+// --- session/list ---
 
-/// session/list result: snapshot of all live sessions on this transport.
+/// session/list request params (cwd filter and cursor are parsed but not yet applied).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListParams {
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// session/list result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListResult {
     pub sessions: Vec<SessionInfo>,
+    /// Pagination cursor for the next page (null when no more pages).
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Per-session metadata returned by session/list.
@@ -157,8 +169,15 @@ pub struct SessionInfo {
     /// The session identifier.
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    /// Whether a session/prompt is currently in flight for this session.
-    pub pending: bool,
+    /// Working directory for the session (from session/new params, or empty string if not set).
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Extension metadata (ZeptoClaw sets `pending: bool` to indicate an in-flight prompt).
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 // --- session/cancel (notification) ---

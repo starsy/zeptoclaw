@@ -19,7 +19,7 @@
 //! independent from the stdio `"acp"` channel and the bus routes outbound
 //! messages to the correct transport.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,8 +36,8 @@ use crate::error::{Result, ZeptoError};
 
 use super::acp_protocol::{
     AgentCapabilities, AgentInfo, ContentBlock, InitializeResult, JsonRpcRequest,
-    PromptContentBlock, SessionInfo, SessionListResult, SessionNewResult, SessionPromptResult,
-    SessionUpdateParams, SessionUpdatePayload,
+    PromptContentBlock, SessionInfo, SessionListParams, SessionListResult, SessionNewResult,
+    SessionPromptResult, SessionUpdateParams, SessionUpdatePayload,
 };
 use super::{BaseChannelConfig, Channel};
 
@@ -103,7 +103,8 @@ type PromptMap = Arc<Mutex<HashMap<String, oneshot::Sender<(String, bool)>>>>;
 /// Mutable per-channel ACP state shared between the accept loop and `send()`.
 struct AcpHttpState {
     initialized: bool,
-    sessions: HashSet<String>,
+    /// Session IDs → working directory (from session/new params, None if not provided).
+    sessions: HashMap<String, Option<String>>,
     /// Tracks in-flight session/prompt requests so `send()` can retrieve the
     /// original request id and cancelled flag when the agent replies.
     pending: HashMap<String, PendingPrompt>,
@@ -113,7 +114,7 @@ impl AcpHttpState {
     fn new() -> Self {
         Self {
             initialized: false,
-            sessions: HashSet::new(),
+            sessions: HashMap::new(),
             pending: HashMap::new(),
         }
     }
@@ -278,7 +279,7 @@ impl AcpHttpChannel {
 
     async fn do_initialize(
         state: &Arc<Mutex<AcpHttpState>>,
-        config: &AcpChannelConfig,
+        _config: &AcpChannelConfig,
         id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
     ) -> String {
@@ -298,14 +299,18 @@ impl AcpHttpChannel {
             st.initialized = true;
         }
         let result = InitializeResult {
-            protocol_version: serde_json::json!(config.protocol_version),
+            protocol_version: serde_json::json!(1),
             agent_capabilities: AgentCapabilities {
                 load_session: Some(false),
                 prompt_capabilities: Some(serde_json::json!({
                     "image": false, "audio": false, "embeddedContext": false
                 })),
                 mcp_capabilities: Some(serde_json::json!({ "http": false, "sse": false })),
-                session_capabilities: Some(HashMap::new()),
+                session_capabilities: Some({
+                    let mut m = HashMap::new();
+                    m.insert("list".to_string(), serde_json::json!({}));
+                    m
+                }),
             },
             agent_info: Some(AgentInfo {
                 name: Some("zeptoclaw".to_string()),
@@ -324,10 +329,14 @@ impl AcpHttpChannel {
         state: &Arc<Mutex<AcpHttpState>>,
         base_config: &BaseChannelConfig,
         id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
     ) -> String {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
             return Self::json_rpc_error(id, -32000, "Unauthorized");
         }
+        let cwd = params
+            .and_then(|p| serde_json::from_value::<super::acp_protocol::SessionNewParams>(p).ok())
+            .and_then(|p| p.cwd);
         let session_id = format!("acph_{}", uuid::Uuid::new_v4().simple());
         {
             let mut st = state.lock().await;
@@ -345,7 +354,7 @@ impl AcpHttpChannel {
                     &format!("too many sessions (limit: {})", MAX_ACP_SESSIONS),
                 );
             }
-            st.sessions.insert(session_id.clone());
+            st.sessions.insert(session_id.clone(), cwd);
         }
         let result = SessionNewResult { session_id };
         match serde_json::to_value(result) {
@@ -375,11 +384,11 @@ impl AcpHttpChannel {
         "{}".to_string()
     }
 
-    /// Handle session/list (ZeptoClaw extension): return all live sessions with
-    /// their pending state as a synchronous JSON response.
+    /// Handle session/list: return all live sessions with per-session metadata.
     async fn do_session_list(
         state: &Arc<Mutex<AcpHttpState>>,
         id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
     ) -> String {
         let st = state.lock().await;
         if !st.initialized {
@@ -389,15 +398,24 @@ impl AcpHttpChannel {
                 "initialize must be called before session/list",
             );
         }
+        // Parse params for cwd filter and cursor; currently accepted but not applied.
+        let _list_params: Option<SessionListParams> =
+            params.and_then(|p| serde_json::from_value(p).ok());
         let sessions: Vec<SessionInfo> = st
             .sessions
             .iter()
-            .map(|sid| SessionInfo {
+            .map(|(sid, cwd)| SessionInfo {
                 session_id: sid.clone(),
-                pending: st.pending.contains_key(sid),
+                cwd: cwd.clone().unwrap_or_default(),
+                title: None,
+                updated_at: None,
+                meta: Some(serde_json::json!({ "pending": st.pending.contains_key(sid) })),
             })
             .collect();
-        let result = SessionListResult { sessions };
+        let result = SessionListResult {
+            sessions,
+            next_cursor: None,
+        };
         match serde_json::to_value(result) {
             Ok(v) => Self::json_rpc_result(id, v),
             Err(e) => Self::json_rpc_error(id, -32603, &format!("serialize error: {}", e)),
@@ -467,7 +485,7 @@ impl AcpHttpChannel {
         }
         {
             let mut st = state.lock().await;
-            if !st.sessions.contains(&session_id) {
+            if !st.sessions.contains_key(&session_id) {
                 return Ok(Err(Self::json_rpc_error(
                     id,
                     -32602,
@@ -708,7 +726,7 @@ impl AcpHttpChannel {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
             "session/new" => {
-                let body = Self::do_session_new(&state, &base_config, id).await;
+                let body = Self::do_session_new(&state, &base_config, id, params).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
@@ -718,7 +736,7 @@ impl AcpHttpChannel {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
             "session/list" => {
-                let body = Self::do_session_list(&state, id).await;
+                let body = Self::do_session_list(&state, id, params).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
@@ -890,7 +908,7 @@ impl Channel for AcpHttpChannel {
         // Check that the session is known and consume the pending prompt record.
         let (session_exists, cancelled) = {
             let mut st = self.state.lock().await;
-            let exists = st.sessions.contains(&session_id);
+            let exists = st.sessions.contains_key(&session_id);
             let cancelled = st
                 .pending
                 .remove(&session_id)
@@ -1030,7 +1048,7 @@ mod tests {
         let session_id = "acph_test".to_string();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone());
+            st.sessions.insert(session_id.clone(), None);
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
         }
@@ -1071,7 +1089,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<(String, bool)>();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone());
+            st.sessions.insert(session_id.clone(), None);
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
             ch.pending_http.lock().await.insert(session_id.clone(), tx);
@@ -1098,7 +1116,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<(String, bool)>();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone());
+            st.sessions.insert(session_id.clone(), None);
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: true });
             ch.pending_http.lock().await.insert(session_id.clone(), tx);
@@ -1136,9 +1154,13 @@ mod tests {
             bus,
         );
         ch.state.lock().await.initialized = true;
-        let result =
-            AcpHttpChannel::do_session_new(&ch.state, &ch.base_config, Some(serde_json::json!(1)))
-                .await;
+        let result = AcpHttpChannel::do_session_new(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(1)),
+            None,
+        )
+        .await;
         assert!(
             result.contains("Unauthorized"),
             "deny_by_default must block session/new"
@@ -1174,7 +1196,8 @@ mod tests {
     #[tokio::test]
     async fn test_session_list_requires_initialize() {
         let ch = make_channel();
-        let body = AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1))).await;
+        let body =
+            AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1)), None).await;
         assert!(
             body.contains("-32600"),
             "session/list before initialize must return -32600"
@@ -1185,7 +1208,8 @@ mod tests {
     async fn test_session_list_empty() {
         let ch = make_channel();
         ch.state.lock().await.initialized = true;
-        let body = AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1))).await;
+        let body =
+            AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1)), None).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["sessions"], serde_json::json!([]));
     }
@@ -1198,17 +1222,18 @@ mod tests {
         {
             let mut st = ch.state.lock().await;
             st.initialized = true;
-            st.sessions.insert(sid_a.clone());
-            st.sessions.insert(sid_b.clone());
+            st.sessions.insert(sid_a.clone(), None);
+            st.sessions.insert(sid_b.clone(), None);
             st.pending
                 .insert(sid_a.clone(), PendingPrompt { cancelled: false });
         }
-        let body = AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1))).await;
+        let body =
+            AcpHttpChannel::do_session_list(&ch.state, Some(serde_json::json!(1)), None).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let sessions = v["result"]["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 2);
         let find = |sid: &str| sessions.iter().find(|s| s["sessionId"] == sid).cloned();
-        assert_eq!(find(&sid_a).unwrap()["pending"], true);
-        assert_eq!(find(&sid_b).unwrap()["pending"], false);
+        assert_eq!(find(&sid_a).unwrap()["_meta"]["pending"], true);
+        assert_eq!(find(&sid_b).unwrap()["_meta"]["pending"], false);
     }
 }

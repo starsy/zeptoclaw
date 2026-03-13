@@ -19,8 +19,8 @@ use crate::error::{Result, ZeptoError};
 
 use super::acp_protocol::{
     AgentCapabilities, AgentInfo, ContentBlock, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    SessionInfo, SessionListResult, SessionNewResult, SessionPromptResult, SessionUpdateParams,
-    SessionUpdatePayload,
+    SessionInfo, SessionListParams, SessionListResult, SessionNewResult, SessionPromptResult,
+    SessionUpdateParams, SessionUpdatePayload,
 };
 use super::{BaseChannelConfig, Channel};
 
@@ -41,8 +41,8 @@ struct PendingPrompt {
 struct AcpState {
     /// Whether the client has called initialize.
     initialized: bool,
-    /// Session IDs created via session/new.
-    sessions: std::collections::HashSet<String>,
+    /// Session IDs → working directory (from session/new params, None if not provided).
+    sessions: HashMap<String, Option<String>>,
     /// Per-session pending prompt: we respond when we get the matching outbound message.
     pending: HashMap<String, PendingPrompt>,
 }
@@ -51,7 +51,7 @@ impl AcpState {
     fn new() -> Self {
         Self {
             initialized: false,
-            sessions: std::collections::HashSet::new(),
+            sessions: HashMap::new(),
             pending: HashMap::new(),
         }
     }
@@ -142,8 +142,9 @@ impl AcpChannel {
             };
             return self.write_response(&response).await;
         }
-        let _params: Option<super::acp_protocol::SessionNewParams> =
-            params.and_then(|p| serde_json::from_value(p).ok());
+        let cwd = params
+            .and_then(|p| serde_json::from_value::<super::acp_protocol::SessionNewParams>(p).ok())
+            .and_then(|p| p.cwd);
         let session_id = format!("acp_{}", uuid::Uuid::new_v4().simple());
         {
             let mut state = self.state.lock().await;
@@ -173,7 +174,7 @@ impl AcpChannel {
                 };
                 return self.write_response(&response).await;
             }
-            state.sessions.insert(session_id.clone());
+            state.sessions.insert(session_id.clone(), cwd);
         }
         let result = SessionNewResult {
             session_id: session_id.clone(),
@@ -276,7 +277,7 @@ impl AcpChannel {
         }
         {
             let mut state = self.state.lock().await;
-            if !state.sessions.contains(&session_id) {
+            if !state.sessions.contains_key(&session_id) {
                 let response = JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: id.clone(),
@@ -332,7 +333,7 @@ impl AcpChannel {
                 ZeptoError::Channel("ACP: session/cancel missing or invalid params".into())
             })?;
         let mut state = self.state.lock().await;
-        if !state.sessions.contains(&params.session_id) {
+        if !state.sessions.contains_key(&params.session_id) {
             debug!(session_id = %params.session_id, "ACP: session/cancel for unknown session, ignoring");
             return Ok(());
         }
@@ -343,9 +344,12 @@ impl AcpChannel {
         Ok(())
     }
 
-    /// Handle session/list (ZeptoClaw extension): return all live sessions with
-    /// their pending state.
-    async fn handle_session_list(&self, id: Option<serde_json::Value>) -> Result<()> {
+    /// Handle session/list: return all live sessions with per-session metadata.
+    async fn handle_session_list(
+        &self,
+        id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
+    ) -> Result<()> {
         let state = self.state.lock().await;
         if !state.initialized {
             let response = JsonRpcResponse {
@@ -360,15 +364,24 @@ impl AcpChannel {
             };
             return self.write_response(&response).await;
         }
+        // Parse params for cwd filter and cursor; currently accepted but not applied.
+        let _list_params: Option<SessionListParams> =
+            params.and_then(|p| serde_json::from_value(p).ok());
         let sessions: Vec<SessionInfo> = state
             .sessions
             .iter()
-            .map(|sid| SessionInfo {
+            .map(|(sid, cwd)| SessionInfo {
                 session_id: sid.clone(),
-                pending: state.pending.contains_key(sid),
+                cwd: cwd.clone().unwrap_or_default(),
+                title: None,
+                updated_at: None,
+                meta: Some(serde_json::json!({ "pending": state.pending.contains_key(sid) })),
             })
             .collect();
-        let result = SessionListResult { sessions };
+        let result = SessionListResult {
+            sessions,
+            next_cursor: None,
+        };
         let response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
@@ -454,7 +467,7 @@ impl AcpChannel {
                 "session/list" => {
                     let channel =
                         Self::channel_ref(&bus, &state, &stdout, &config, &base_config, &running);
-                    channel.handle_session_list(id.clone()).await
+                    channel.handle_session_list(id.clone(), params).await
                 }
                 _ => {
                     let _ = Self::write_error_response(
@@ -556,14 +569,18 @@ impl AcpChannel {
             state.initialized = true;
         }
         let result = InitializeResult {
-            protocol_version: serde_json::json!(self.config.protocol_version),
+            protocol_version: serde_json::json!(1),
             agent_capabilities: AgentCapabilities {
                 load_session: Some(false),
                 prompt_capabilities: Some(
                     serde_json::json!({ "image": false, "audio": false, "embeddedContext": false }),
                 ),
                 mcp_capabilities: Some(serde_json::json!({ "http": false, "sse": false })),
-                session_capabilities: Some(HashMap::new()),
+                session_capabilities: Some({
+                    let mut m = HashMap::new();
+                    m.insert("list".to_string(), serde_json::json!({}));
+                    m
+                }),
             },
             agent_info: Some(AgentInfo {
                 name: Some("zeptoclaw".to_string()),
@@ -650,7 +667,7 @@ impl Channel for AcpChannel {
         let session_id = msg.chat_id.clone();
         let (pending, session_exists) = {
             let mut state = self.state.lock().await;
-            let exists = state.sessions.contains(&session_id);
+            let exists = state.sessions.contains_key(&session_id);
             (state.pending.remove(&session_id), exists)
         };
         if !session_exists {
@@ -722,7 +739,7 @@ mod tests {
         let session_id = "acp_some_session".to_string();
         {
             let mut state = channel.state.lock().await;
-            state.sessions.insert(session_id.clone());
+            state.sessions.insert(session_id.clone(), None);
             state.pending.insert(
                 session_id.clone(),
                 PendingPrompt {
@@ -815,7 +832,7 @@ mod tests {
         {
             let mut state = channel.state.lock().await;
             state.initialized = true;
-            state.sessions.insert(session_id.clone());
+            state.sessions.insert(session_id.clone(), None);
         }
         let oversized = "a".repeat(MAX_PROMPT_BYTES + 1);
         let params = serde_json::json!({
@@ -844,7 +861,7 @@ mod tests {
         {
             let mut state = channel.state.lock().await;
             state.initialized = true;
-            state.sessions.insert(session_id.clone());
+            state.sessions.insert(session_id.clone(), None);
             state.pending.insert(
                 session_id.clone(),
                 PendingPrompt {
@@ -917,7 +934,7 @@ mod tests {
         {
             // Seed a session directly to isolate the initialized check.
             let mut state = channel.state.lock().await;
-            state.sessions.insert(session_id.clone());
+            state.sessions.insert(session_id.clone(), None);
         }
         let params = serde_json::json!({
             "sessionId": session_id,
@@ -943,7 +960,7 @@ mod tests {
         let known = "acp_known".to_string();
         {
             let mut state = channel.state.lock().await;
-            state.sessions.insert(known.clone());
+            state.sessions.insert(known.clone(), None);
             state.pending.insert(
                 known.clone(),
                 PendingPrompt {
@@ -1002,7 +1019,7 @@ mod tests {
         let session_id = "acp_proactive".to_string();
         {
             let mut state = channel.state.lock().await;
-            state.sessions.insert(session_id.clone());
+            state.sessions.insert(session_id.clone(), None);
         }
         let msg = OutboundMessage {
             channel: ACP_CHANNEL_NAME.to_string(),
@@ -1015,7 +1032,7 @@ mod tests {
         assert!(result.is_ok());
         let state = channel.state.lock().await;
         assert!(
-            state.sessions.contains(&session_id),
+            state.sessions.contains_key(&session_id),
             "proactive send must not remove the session from state"
         );
     }
@@ -1032,7 +1049,7 @@ mod tests {
             let mut state = channel.state.lock().await;
             state.initialized = true;
             for i in 0..MAX_ACP_SESSIONS {
-                state.sessions.insert(format!("acp_{}", i));
+                state.sessions.insert(format!("acp_{}", i), None);
             }
         }
         let _ = channel
@@ -1054,7 +1071,7 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let channel = AcpChannel::new(config, base, bus);
         let _ = channel
-            .handle_session_list(Some(serde_json::json!(1)))
+            .handle_session_list(Some(serde_json::json!(1)), None)
             .await;
         // No sessions, no crash — just confirm the call completes.
         let state = channel.state.lock().await;
@@ -1074,8 +1091,8 @@ mod tests {
         {
             let mut state = channel.state.lock().await;
             state.initialized = true;
-            state.sessions.insert(sid_a.clone());
-            state.sessions.insert(sid_b.clone());
+            state.sessions.insert(sid_a.clone(), None);
+            state.sessions.insert(sid_b.clone(), None);
             // Mark sid_a as having a prompt in flight.
             state.pending.insert(
                 sid_a.clone(),
@@ -1090,7 +1107,7 @@ mod tests {
         let sessions: Vec<_> = state
             .sessions
             .iter()
-            .map(|sid| (sid.clone(), state.pending.contains_key(sid)))
+            .map(|(sid, _)| (sid.clone(), state.pending.contains_key(sid)))
             .collect();
         drop(state);
 

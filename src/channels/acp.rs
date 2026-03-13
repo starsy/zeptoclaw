@@ -65,6 +65,10 @@ pub struct AcpChannel {
     running: Arc<AtomicBool>,
     state: Arc<Mutex<AcpState>>,
     stdout: Arc<Mutex<tokio::io::Stdout>>,
+    /// Handle to the background stdin-loop task spawned by `start()`.
+    /// Stored so `stop()` can abort the task immediately rather than waiting
+    /// for the blocking `next_line()` call to naturally yield.
+    stdio_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AcpChannel {
@@ -81,6 +85,7 @@ impl AcpChannel {
             running: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(AcpState::new())),
             stdout: Arc::new(Mutex::new(tokio::io::stdout())),
+            stdio_handle: None,
         }
     }
 
@@ -347,12 +352,21 @@ impl AcpChannel {
     }
 
     /// Handle session/cancel: mark pending prompt as cancelled for that session.
+    ///
+    /// This is a notification (no id), so we must never return Err (which would
+    /// cause the dispatch loop to emit a -32603 response to a notification — a
+    /// spec violation). Invalid params and unauthorized requests are silently
+    /// ignored per the JSON-RPC 2.0 spec for notifications.
     async fn handle_session_cancel(&self, params: Option<serde_json::Value>) -> Result<()> {
-        let params: super::acp_protocol::SessionCancelParams = params
-            .and_then(|p| serde_json::from_value(p).ok())
-            .ok_or_else(|| {
-                ZeptoError::Channel("ACP: session/cancel missing or invalid params".into())
-            })?;
+        if !self.is_allowed(ACP_SENDER_ID) {
+            return Ok(());
+        }
+        let params = match params.and_then(|p| {
+            serde_json::from_value::<super::acp_protocol::SessionCancelParams>(p).ok()
+        }) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
         let mut state = self.state.lock().await;
         if !state.sessions.contains_key(&params.session_id) {
             debug!(session_id = %params.session_id, "ACP: session/cancel for unknown session, ignoring");
@@ -579,6 +593,7 @@ impl AcpChannel {
             running: Arc::clone(running),
             state: Arc::clone(state),
             stdout: Arc::clone(stdout),
+            stdio_handle: None,
         }
     }
 
@@ -710,19 +725,25 @@ impl Channel for AcpChannel {
         let config = self.config.clone();
         let base_config = self.base_config.clone();
         let running = Arc::clone(&self.running);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) =
                 Self::run_stdin_loop(bus, state, stdout, config, base_config, running).await
             {
                 error!(error = %e, "ACP stdin loop error");
             }
         });
+        self.stdio_handle = Some(handle);
         info!("ACP channel started (stdio)");
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
         self.running.store(false, Ordering::SeqCst);
+        // Abort the background stdin-loop task so stop() takes effect immediately
+        // rather than waiting for the blocked next_line() call to yield.
+        if let Some(handle) = self.stdio_handle.take() {
+            handle.abort();
+        }
         Ok(())
     }
 

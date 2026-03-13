@@ -870,6 +870,8 @@ impl Channel for AcpHttpChannel {
         }
         let addr = format!("{}:{}", self.http_config.bind, self.http_config.port);
         let listener = TcpListener::bind(&addr).await.map_err(|e| {
+            // Reset the flag so is_running() doesn't report a stale true state.
+            self.running.store(false, Ordering::SeqCst);
             ZeptoError::Channel(format!("ACP-HTTP: failed to bind {}: {}", addr, e))
         })?;
 
@@ -907,6 +909,9 @@ impl Channel for AcpHttpChannel {
         // handlers currently awaiting a prompt response to receive RecvError and
         // return, so no HTTP connection is left hanging after stop().
         self.pending_http.lock().await.clear();
+        // Clear state.pending so sessions are not permanently marked in-flight
+        // across a stop/restart cycle (supervisor may restart the channel).
+        self.state.lock().await.pending.clear();
         Ok(())
     }
 

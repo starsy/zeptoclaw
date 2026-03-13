@@ -531,6 +531,11 @@ async fn test_session_prompt_unknown_session_returns_error() {
         resp.get("error").is_some(),
         "session/prompt with unknown session must return error; got: {resp}"
     );
+    let code = resp["error"]["code"].as_i64().unwrap_or(0);
+    assert_eq!(
+        code, -32000,
+        "unknown session must return -32000 (not -32602 invalid params); got code {code}"
+    );
 }
 
 /// session/cancel is a notification (no id); the server must NOT send a response.
@@ -774,7 +779,7 @@ fn test_acpx_sessions_list_after_exec() {
     std::fs::create_dir_all(&tmp).ok();
 
     // Run exec to force a session to be created.
-    std::process::Command::new(&acpx)
+    let exec_out = std::process::Command::new(&acpx)
         .args([
             "--agent",
             &agent_cmd,
@@ -790,5 +795,41 @@ fn test_acpx_sessions_list_after_exec() {
         ])
         .env("RUST_LOG", "")
         .output()
-        .ok();
+        .expect("failed to run acpx exec");
+    assert!(
+        exec_out.status.success(),
+        "acpx exec must succeed; stderr: {}",
+        String::from_utf8_lossy(&exec_out.stderr)
+    );
+
+    // sessions list must show the session we just created.
+    let list_out = std::process::Command::new(&acpx)
+        .args([
+            "--agent",
+            &agent_cmd,
+            "--cwd",
+            tmp.to_str().unwrap(),
+            "--format",
+            "json",
+            "sessions",
+            "list",
+        ])
+        .env("RUST_LOG", "")
+        .output()
+        .expect("failed to run acpx sessions list");
+    assert!(
+        list_out.status.success(),
+        "acpx sessions list must succeed; stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(
+        !list_stdout.trim().is_empty(),
+        "sessions list output must be non-empty"
+    );
+    // The listing must contain at least one session entry for the cwd we used.
+    assert!(
+        list_stdout.contains("acp_") || list_stdout.contains("sessionId"),
+        "sessions list must contain session data; got: {list_stdout}"
+    );
 }

@@ -563,6 +563,14 @@ pub async fn run() -> Result<()> {
         logging_cfg.level = "warn".to_string();
     }
 
+    // ACP stdio mode: suppress all logging unless RUST_LOG is explicitly set.
+    // Any tracing output to stdout would corrupt the JSON-RPC stream that the
+    // ACP client reads line-by-line. Users who want debug logs should redirect:
+    //   RUST_LOG=debug zeptoclaw acp 2>acp.log
+    if matches!(cli.command, Some(Commands::Acp)) && std::env::var("RUST_LOG").is_err() {
+        logging_cfg.level = "off".to_string();
+    }
+
     zeptoclaw::utils::logging::init_logging(&logging_cfg);
 
     match cli.command {

@@ -351,8 +351,8 @@ The following are candidate improvements and extensions, not commitments.
 
 ### 9.2 Factory tests — `src/channels/factory.rs`
 
-- `test_register_configured_channels_registers_acp` — `channels.acp.enabled: true` registers exactly one `"acp"` channel.
-- `test_register_configured_channels_registers_acp_http` — `channels.acp.http.enabled: true` registers both `"acp"` and `"acp_http"` (count = 2).
+- `test_register_configured_channels_acp_enabled_alone_registers_nothing` — `channels.acp.enabled: true` alone registers zero channels (no `"acp"` stdio channel in gateway mode).
+- `test_register_configured_channels_registers_acp_http` — `channels.acp.http.enabled: true` registers exactly one `"acp_http"` channel (count = 1); `channels.acp.enabled` is not required.
 
 ### 9.3 HTTP channel unit tests — `src/channels/acp_http.rs`
 

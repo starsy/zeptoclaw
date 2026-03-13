@@ -15,10 +15,11 @@ ZeptoClaw implements a **minimal** ACP agent surface:
 | ACP method / message | Role | Implemented |
 |----------------------|------|--------------|
 | `initialize` | Handshake; client → agent | Yes — sets `initialized` flag, logs client info, returns capabilities |
-| `session/new` | Create session; client → agent | Yes — requires prior `initialize`; capped at 1 000 live sessions |
-| `session/prompt` | Send user prompt; client → agent | Yes — text blocks only; requires `initialize`; in-flight and size guards |
+| `session/new` | Create session; client → agent | Yes — requires prior `initialize`; stores cwd; capped at 1 000 live sessions |
+| `session/prompt` | Send user prompt; client → agent | Yes — text and ResourceLink blocks; requires `initialize`; in-flight and size guards |
 | `session/cancel` | Cancel in-flight prompt; client → agent | Yes — notification; validates session existence |
 | `session/update` | Agent progress / result; agent → client | Yes — text chunks for both prompted and proactive replies |
+| `session/list` | List live sessions; client → agent | Yes — returns all sessions with cwd/sessionId/title; supports cwd filter and cursor |
 
 Two transports are supported:
 
@@ -29,8 +30,9 @@ Two transports are supported:
 
 - **Client filesystem / terminal callbacks** — No `filesystem/*` or `terminal/*` request handling; the agent does not invoke client-side filesystem or terminal APIs.
 - **Streaming token-by-token** — Agent replies are delivered as a single `session/update` with the full text plus a single `session/prompt` response; incremental streaming of tokens is not implemented.
-- **MCP over ACP** — MCP server discovery/capabilities are advertised as disabled in `initialize`; no ACP-specific MCP wiring.
+- **MCP over ACP** — MCP server discovery/capabilities are advertised as disabled in `initialize`; no ACP-specific MCP wiring. The `mcpServers` field in `session/new` is accepted but not acted on.
 - **Session loading / persistence** — `loadSession` is reported as `false`; the agent does not restore prior session state from the client.
+- **Image / audio / embedded-resource content** — `image`, `audio`, and `resource` (embedded) blocks in `session/prompt` are silently ignored. Only `text` and `resource_link` blocks are used.
 
 ---
 
@@ -38,12 +40,15 @@ Two transports are supported:
 
 ### 2.1 ACP as a channel
 
-ACP is implemented as a **normal ZeptoClaw channel** (the `Channel` trait), not a separate entry point or binary. When `channels.acp.enabled` is true and the user runs `zeptoclaw gateway`, the ACP channel is registered with `ChannelManager` and shares the same `MessageBus` as Telegram, Discord, etc.
+ACP is implemented as a **normal ZeptoClaw channel** (the `Channel` trait). There are two entry points:
+
+1. **`zeptoclaw gateway`** — When `channels.acp.enabled` is true, the ACP channel is registered with `ChannelManager` and shares the same `MessageBus` as Telegram, Discord, etc.
+2. **`zeptoclaw acp`** — Standalone subcommand that starts just the ACP stdio agent without the full gateway. Calls `AcpChannel::run_stdio()`, which blocks until stdin closes. This is the entry point used by `acpx` and other ACP clients that spawn the agent as a subprocess.
 
 **Rationale:**
 
 - Reuses the existing channel lifecycle (start/stop), bus subscription, and outbound dispatch.
-- Keeps a single process model: one gateway can serve ACP on stdio; in practice, when ACP is enabled, the process is typically run as a subprocess so stdio is dedicated to the ACP client.
+- `run_stdio()` blocks for the subprocess model; `start()` spawns a background task for the gateway model.
 - Allows consistent allowlist/deny behavior via `BaseChannelConfig` and future multi-channel gateways if needed.
 
 ### 2.2 Session and identity mapping
@@ -105,7 +110,7 @@ src/channels/
 **AcpState** holds:
 
 - `initialized: bool` — set to `true` when the client calls `initialize`; `session/new` and `session/prompt` are rejected until it is true.
-- `sessions: HashSet<String>` — session IDs created via `session/new`; capped at `MAX_ACP_SESSIONS` (1 000).
+- `sessions: HashMap<String, Option<String>>` — session ID → optional `cwd`. Created via `session/new`; capped at `MAX_ACP_SESSIONS` (1 000). The `cwd` is used by `session/list` for filtering.
 - `pending: HashMap<String, PendingPrompt>` — per-session pending prompt: `request_id` and `cancelled` flag.
 
 All request handlers and `send()` share the same `AcpState` so that prompt correlation and cancellation are consistent.
@@ -126,15 +131,22 @@ No changes were required to the generic bus or agent loop; they only see standar
 - **Handler:** `handle_initialize` (instance method on `AcpChannel`).
 - **Client info:** If the client sends `clientInfo` (name, version) and `protocolVersion` in the request params, they are parsed and logged at `info!`/`debug!` level for diagnostics. Missing or malformed params are accepted without error.
 - **State:** Sets `state.initialized = true`. Until this is called, `session/new` and `session/prompt` return `-32600` Invalid Request.
-- **Response:** `protocolVersion` from config (default `"2024-11-05"`, passed as a string — not parsed numerically), `agentCapabilities` with `load_session: false`, prompt capabilities (image/audio/embeddedContext false), MCP (http/sse false), `agentInfo` (name/title/version from crate), `auth_methods: []`.
+- **Response fields (schema-authoritative):**
+  - `protocolVersion: 1` — integer per schema.md (ProtocolVersion type is `uint16`); the `protocol_version` config field is ignored.
+  - `agentCapabilities.loadSession: false`
+  - `agentCapabilities.promptCapabilities` — image/audio/embeddedContext all false
+  - `agentCapabilities.mcpCapabilities` — http/sse both false (field name is `"mcpCapabilities"`, not `"mcp"`)
+  - `agentCapabilities.sessionCapabilities.list: {}` — advertises `session/list` support
+  - `agentInfo.name: "zeptoclaw"`, `agentInfo.version: "<crate version>"` — both required strings per schema; `agentInfo.title` is optional
+  - `authMethods: []`
 - **Design:** We do not negotiate capabilities; we advertise a minimal, static set so clients know we support only the methods we implement. `initialize` may be called multiple times; each call re-sets the flag and re-logs client info.
 
 ### 4.2 session/new
 
-- **Params:** Optional `cwd`, `mcpServers`; we accept but do not use them.
+- **Params:** `cwd` (required per schema, accepted as optional for lenient parsing), `mcpServers` (accepted but not acted on).
 - **Pre-conditions:** `is_allowed("acp_client")` must be true (else `-32000` Unauthorized); `state.initialized` must be true (else `-32600` Invalid Request); `state.sessions.len()` must be below `MAX_ACP_SESSIONS` (else `-32000` Too many sessions).
-- **Behavior:** Generate `session_id = acp_<uuid>`, insert into `state.sessions`, return `{ sessionId }`.
-- **Design:** Session is created and tracked in memory only; no filesystem or client callback. Sessions are never explicitly deleted — they persist for the lifetime of the gateway process. The cap of 1 000 prevents unbounded memory growth from reconnecting or misbehaving clients.
+- **Behavior:** Generate `session_id = acp_<uuid>`, extract `cwd` from params, insert `(session_id, cwd)` into `state.sessions`, return `{ sessionId }`.
+- **Design:** Session is created and tracked in memory only; no filesystem or client callback. Sessions are never explicitly deleted — they persist for the lifetime of the process. The `cwd` is stored so `session/list` can filter by working directory. The cap of 1 000 prevents unbounded memory growth from reconnecting or misbehaving clients.
 
 ### 4.3 session/prompt
 
@@ -142,11 +154,11 @@ No changes were required to the generic bus or agent loop; they only see standar
 - **Pre-conditions (checked in order):**
   1. `is_allowed("acp_client")` — else `-32000` Unauthorized.
   2. `state.initialized` — else `-32600` Invalid Request.
-  3. Content extracted from text blocks is non-empty — else `-32602` Invalid params.
+  3. Content extracted from text and resource_link blocks is non-empty — else `-32602` Invalid params.
   4. Content size ≤ `MAX_PROMPT_BYTES` (102 400 bytes) — else `-32602` Invalid params. Enforced before any state change so oversized payloads never reach the bus.
-  5. `sessionId` is in `state.sessions` — else `-32602` Invalid params.
+  5. `sessionId` is in `state.sessions` — else `-32000` Application error (not `-32602`; unknown session is a runtime condition, not an invalid-params condition).
   6. No existing entry in `state.pending` for this session — else `-32602` Invalid params ("a prompt is already in flight"). Clients must wait for the previous `session/prompt` response before sending another.
-- **Content extraction:** Only `text` blocks are used; other types (`resource`, `image`, `Other`) are ignored. Extracted texts are joined with newlines and trimmed.
+- **Content extraction:** `text` blocks contribute their text; `resource_link` blocks contribute `[Resource: <name> (<uri>)]`; other types (`image`, `audio`, `resource`, `Other`) are silently ignored. Extracted parts are joined with newlines and trimmed. All agents MUST support `text` and `resource_link` per the ACP spec.
 - **Flow:** Store `PendingPrompt { request_id, cancelled: false }` under `session_id`, publish `InboundMessage`, then return without sending a response. The response is sent later from `send()` when the matching `OutboundMessage` arrives.
 
 ### 4.4 session/cancel
@@ -155,7 +167,21 @@ No changes were required to the generic bus or agent loop; they only see standar
 - **Behavior:** If the session is not in `state.sessions`, the notification is silently ignored (no response — this is correct per spec for notifications). If the session exists and has a pending prompt, set `cancelled: true`. No response in either case.
 - **Design:** This ensures a cancel for a fabricated or already-closed session does not accidentally affect pending state for other sessions.
 
-### 4.5 session/update (agent → client)
+### 4.5 session/list
+
+- **Handler:** `handle_session_list` (stdio) / `do_session_list` (HTTP).
+- **Availability:** Only callable after `initialize` (else `-32600`). Only accessible to clients that received `sessionCapabilities.list: {}` in the `initialize` response.
+- **Params:** `cwd` (optional string — filter sessions by working directory); `cursor` (optional — accepted but pagination is not yet implemented; `nextCursor` is always null).
+- **Behavior:** Iterate `state.sessions`. If `cwd` is provided, return only sessions whose stored cwd matches exactly. Each session is returned as a `SessionInfo` object:
+  - `sessionId: String` (required)
+  - `cwd: String` (required — the cwd stored at `session/new` time, or `"unknown"` if absent)
+  - `title: null` (not implemented)
+  - `updatedAt: null` (not implemented)
+  - `_meta: { "pending": bool }` — non-standard extension indicating whether a prompt is in flight
+- **Response:** `{ sessions: [...], nextCursor: null }`.
+- **Design:** `_meta.pending` lets clients show active-session indicators without a separate status call.
+
+### 4.6 session/update (agent → client)
 
 - **Emitted in:** `AcpChannel::send()`.
 - **Payload:** `sessionUpdate: "agent_message_chunk"`, `content: { type: "text", text: "<message content>" }`. One notification is sent per outbound message (full text of that message).
@@ -163,16 +189,18 @@ No changes were required to the generic bus or agent loop; they only see standar
 - **Proactive path:** If the agent sends an outbound message for a known session but no pending prompt is in flight (e.g. from a cron routine or a spawned task), only the `session/update` notification is sent; no `session/prompt` response is sent (there is no open request to complete).
 - **Unknown session:** If the session is not in `state.sessions`, the outbound message is silently dropped.
 
-### 4.6 Errors
+### 4.7 Errors
 
 | Code | Meaning | Triggers |
 |------|---------|---------|
 | `-32700` | Parse error | Invalid JSON on stdin |
-| `-32600` | Invalid Request | `jsonrpc` field not `"2.0"`; `session/new` or `session/prompt` before `initialize` |
+| `-32600` | Invalid Request | `jsonrpc` field not `"2.0"`; `session/new`, `session/prompt`, or `session/list` before `initialize` |
 | `-32601` | Method not found | Unrecognized method name |
-| `-32602` | Invalid params | Missing/invalid params; unknown session; empty prompt; prompt too large; prompt already in flight |
+| `-32602` | Invalid params | Missing/malformed params; empty prompt; prompt too large; prompt already in flight |
 | `-32603` | Internal error | Unexpected handler failure |
-| `-32000` | Server error | Unauthorized (`is_allowed` failed); too many sessions |
+| `-32000` | Server error | Unauthorized (`is_allowed` failed); too many sessions; unknown session in `session/prompt` |
+
+**Note on `-32602` vs `-32000` for unknown sessions:** An unknown `sessionId` in `session/prompt` is a runtime condition (the session was never created, or the connection was lost), not a malformed parameter. We use `-32000` for this case so clients can distinguish "you gave me bad JSON" (−32602) from "I don't know that session" (−32000) and respond accordingly (e.g. prompt the user to create a new session vs showing a validation error).
 
 All error responses include the request `id` when available so the client can correlate.
 
@@ -185,7 +213,7 @@ Config lives under `channels.acp` (`AcpChannelConfig`):
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | false | If true, register the ACP stdio channel when the gateway starts. |
-| `protocol_version` | string | `"2024-11-05"` | Version advertised in `initialize`. |
+| `protocol_version` | string | `"2024-11-05"` | Stored but not used: `initialize` always advertises `protocolVersion: 1` (integer) per the ACP schema. |
 | `allow_from` | list of string | [] | If non-empty, only these sender IDs are allowed. |
 | `deny_by_default` | bool | false | If true, empty `allow_from` rejects all senders. |
 | `http` | `AcpHttpConfig` or null | null | HTTP transport config (see below). |
@@ -225,6 +253,9 @@ Allowlist/deny is applied via `BaseChannelConfig` built from `allow_from` and `d
 
 ### 6.1 Stdin loop
 
+- **Entry points:** Two ways to run the loop:
+  - `Channel::start()` — spawns the loop as a Tokio background task and returns immediately. Used when ACP is one channel among many inside `zeptoclaw gateway`.
+  - `AcpChannel::run_stdio()` — runs the loop directly on the caller's task and blocks until stdin closes. Used by `zeptoclaw acp` so the standalone subprocess stays alive for the full client session.
 - Runs in a task spawned from `Channel::start()`. The spawned task holds `Arc::clone(&self.running)` — the same atomic as the `AcpChannel` struct — so `is_running()` and `stop()` observe the same state as the task.
 - Uses `BufReader::new(stdin).lines()` and `next_line()` in a loop while `running` is true. The loop exits on stdin EOF, read error, or `stop()` setting the flag.
 - Blank lines are skipped. Each non-blank line is parsed as JSON into `JsonRpcRequest`; then we dispatch by `method` and call the appropriate handler. Handlers that need channel/state/stdout receive an `AcpChannel` value built via `channel_ref()` so they can call the same methods as the main struct.
@@ -255,7 +286,7 @@ Allowlist/deny is applied via `BaseChannelConfig` built from `allow_from` and `d
 - **No session deletion:** Sessions live until the gateway process exits. There is no `session/delete` or equivalent; the cap of 1 000 sessions is the only bound on memory growth.
 - **No streaming:** The full agent reply is sent in one `session/update`. Streaming would require either multiple `session/update` notifications or a different update type and client support.
 - **HTTP transport: no persistent connection between prompts:** The HTTP channel holds the TCP connection open only for the duration of a single `session/prompt`; proactive messages (from cron, spawned tasks) cannot be delivered to the client because there is no long-lived SSE subscription separate from the request.
-- **Text-only prompts:** Only `text` content blocks are used; image/resource blocks are silently ignored.
+- **Prompt content:** `text` and `resource_link` blocks are used (per spec, both MUST be supported). `image`, `audio`, and embedded `resource` blocks are silently ignored; the agent never receives them.
 - **No loadSession:** We always report `load_session: false`; session persistence would require additional protocol and storage design.
 
 ---
@@ -290,7 +321,7 @@ The following are candidate improvements and extensions, not commitments.
 
 ### 8.5 Testing and observability
 
-- **End-to-end tests:** Test harness that drives stdin with a script of JSON-RPC messages and asserts on stdout (responses and notifications). Enables regression testing for handshake, session lifecycle, prompt/cancel, and error cases.
+- **End-to-end tests:** ✅ Done — `tests/acp_acpx.rs` provides 23 integration tests covering wire protocol and `acpx`-driven flows (see §9).
 - **Structured logging:** Add trace or debug logs for ACP method invocations (method, session id, request id) and outbound delivery, with optional redaction of prompt content for privacy.
 - **Metrics:** Count ACP methods, prompt latency (time from `session/prompt` to response), and cancellation rate for monitoring and tuning.
 
@@ -298,7 +329,7 @@ The following are candidate improvements and extensions, not commitments.
 
 ## 9. Testing
 
-**Unit tests (acp.rs) — 14 tests:**
+### 9.1 Unit tests — `src/channels/acp.rs` (15 tests)
 
 | Test | What it verifies |
 |------|-----------------|
@@ -315,12 +346,15 @@ The following are candidate improvements and extensions, not commitments.
 | `test_send_skips_unknown_session` | `send()` for unknown session does not create the session |
 | `test_send_proactive_known_session_does_not_remove_session` | Proactive `send()` keeps the session in `state.sessions` |
 | `test_session_cap_does_not_insert_beyond_limit` | Session cap prevents insertion beyond `MAX_ACP_SESSIONS` |
+| `test_session_list_requires_initialize` | `session/list` before `initialize` returns `-32600` |
+| `test_session_list_returns_all_sessions` | `session/list` returns all created sessions with correct `sessionId` and `cwd` |
 
-**Factory tests:**
+### 9.2 Factory tests — `src/channels/factory.rs`
+
 - `test_register_configured_channels_registers_acp` — `channels.acp.enabled: true` registers exactly one `"acp"` channel.
 - `test_register_configured_channels_registers_acp_http` — `channels.acp.http.enabled: true` registers both `"acp"` and `"acp_http"` (count = 2).
 
-**HTTP channel unit tests (`acp_http.rs`):**
+### 9.3 HTTP channel unit tests — `src/channels/acp_http.rs`
 
 | Test | What it covers |
 |------|---------------|
@@ -336,7 +370,50 @@ The following are candidate improvements and extensions, not commitments.
 | `test_sse_event_format` | SSE event `data:` line formatting |
 | `test_http_200_content_length` | `Content-Length` header matches body length |
 
-Integration or end-to-end tests (driving TCP connections and parsing HTTP/SSE responses) can be added in a separate test harness.
+### 9.4 Integration tests — `tests/acp_acpx.rs` (23 tests)
+
+These tests spawn a real `zeptoclaw acp` subprocess and communicate over stdin/stdout using raw JSON-RPC. No LLM calls are made by the wire-protocol tests (they validate protocol-level behavior before prompts reach the agent loop). The four `acpx` end-to-end tests require a live API key and are gated by `ZEPTOCLAW_E2E_LIVE=1`.
+
+Run with concurrency limiting to avoid config file contention across subprocess spawns:
+
+```bash
+cargo nextest run --test acp_acpx
+```
+
+Nextest is configured in `.config/nextest.toml` to set `threads-required = 4` for all tests in this binary, which limits the number of concurrent `zeptoclaw acp` subprocesses without affecting parallelism for other test binaries.
+
+**Wire-protocol tests (no LLM, 19 tests):**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_initialize_protocol_version_is_integer_one` | `initialize` result has `protocolVersion: 1` (integer, not string) |
+| `test_initialize_advertises_session_list_capability` | `agentCapabilities.sessionCapabilities.list` is present in response |
+| `test_initialize_agent_info_fields_are_strings` | `agentInfo.name` and `agentInfo.version` are non-empty strings |
+| `test_initialize_mcp_capabilities_field_name` | `agentCapabilities.mcpCapabilities` is the correct wire field name (not `"mcp"`) |
+| `test_initialize_auth_methods_defaults_to_empty_array` | `authMethods` is `[]` when not configured |
+| `test_session_new_before_initialize_returns_error` | `session/new` before `initialize` returns `-32600` |
+| `test_session_prompt_before_initialize_returns_error` | `session/prompt` before `initialize` returns `-32600` |
+| `test_unknown_method_returns_method_not_found` | Unrecognized method returns `-32601` |
+| `test_malformed_json_returns_parse_error` | Invalid JSON on stdin returns `-32700` |
+| `test_session_new_returns_session_id` | `session/new` returns a non-empty `sessionId` |
+| `test_session_new_returns_unique_ids` | Two `session/new` calls return distinct session IDs |
+| `test_session_list_contains_created_sessions` | `session/list` includes all previously created sessions |
+| `test_session_list_cwd_filter` | `session/list` with `cwd` param returns only matching sessions |
+| `test_session_list_session_info_has_cwd` | Each `SessionInfo` in the list has the `cwd` stored at creation time |
+| `test_session_list_before_initialize_returns_error` | `session/list` before `initialize` returns `-32600` |
+| `test_session_prompt_unknown_session_returns_error` | `session/prompt` with unknown sessionId returns `-32000` (not `-32602`) |
+| `test_session_cancel_sends_no_response` | `session/cancel` (notification) produces no JSON-RPC response |
+| `test_double_initialize_is_idempotent` | Calling `initialize` twice does not error; second response has valid `protocolVersion` |
+| `test_session_prompt_accepts_resource_link_content` | `resource_link` content block in `session/prompt` is accepted (does not error with `-32602`) |
+
+**`acpx` end-to-end tests (require `ZEPTOCLAW_E2E_LIVE=1`, 4 tests):**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_acpx_exec_basic_prompt` | `acpx exec` produces a non-empty response for a simple prompt |
+| `test_acpx_exec_produces_session_update_events` | `acpx exec` output includes at least one `session/update` notification |
+| `test_acpx_exec_ends_with_end_turn` | Final `session/prompt` response has `stopReason: "end_turn"` |
+| `test_acpx_sessions_list_after_exec` | `acpx sessions list` shows the session created by a preceding `exec` |
 
 ---
 

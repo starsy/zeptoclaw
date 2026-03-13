@@ -1,7 +1,7 @@
 //! ACP (Agent Client Protocol) JSON-RPC and method types.
 //!
-//! Standard methods: initialize, session/new, session/prompt, session/cancel, session/update.
-//! ZeptoClaw extensions: session/list.
+//! Standard methods: initialize, session/new, session/prompt, session/cancel, session/update,
+//! session/list (optional, gated by sessionCapabilities.list).
 //! See https://agentclientprotocol.com/protocol/overview
 
 use serde::{Deserialize, Serialize};
@@ -121,18 +121,42 @@ pub struct SessionPromptParams {
     pub prompt: Vec<PromptContentBlock>,
 }
 
+/// A content block that may appear in a `session/prompt` request.
+///
+/// All agents MUST support `Text` and `ResourceLink`. `Image`, `Audio`, and
+/// `Resource` (embedded) are optional and gated by prompt capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptContentBlock {
-    Text {
-        text: String,
-    },
-    Resource {
-        resource: serde_json::Value,
-    },
+    /// Plain text — MUST be supported by all agents.
+    Text { text: String },
+    /// Embedded resource contents (requires `embeddedContext` capability).
+    Resource { resource: serde_json::Value },
+    /// Image data (requires `image` capability).
     Image {
-        image: serde_json::Value,
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        /// Optional URI reference for the image source.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
     },
+    /// Audio data (requires `audio` capability).
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    /// Resource link — MUST be supported by all agents.
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+    },
+    /// Unknown/future content type — silently ignored.
     #[serde(other)]
     Other,
 }
@@ -203,7 +227,7 @@ pub struct SessionUpdatePayload {
     pub session_update: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentBlock>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,

@@ -190,14 +190,23 @@ impl AcpChannel {
         self.write_response(&response).await
     }
 
-    /// Extract plain text from session/prompt content blocks (minimal: text only).
+    /// Extract plain text from session/prompt content blocks.
+    ///
+    /// `Text` blocks contribute their text directly. `ResourceLink` blocks
+    /// contribute a reference line so the agent is aware of the resource.
+    /// Other block types (Image, Audio, Resource) are not extracted.
     pub(crate) fn prompt_blocks_to_text(
         prompt: &[super::acp_protocol::PromptContentBlock],
     ) -> String {
+        use super::acp_protocol::PromptContentBlock;
         let mut parts = Vec::new();
         for block in prompt {
-            if let super::acp_protocol::PromptContentBlock::Text { text } = block {
-                parts.push(text.clone());
+            match block {
+                PromptContentBlock::Text { text } => parts.push(text.clone()),
+                PromptContentBlock::ResourceLink { uri, name, .. } => {
+                    parts.push(format!("[Resource: {} ({})]", name, uri));
+                }
+                _ => {}
             }
         }
         parts.join("\n").trim().to_string()
@@ -364,12 +373,20 @@ impl AcpChannel {
             };
             return self.write_response(&response).await;
         }
-        // Parse params for cwd filter and cursor; currently accepted but not applied.
-        let _list_params: Option<SessionListParams> =
+        // Parse params; apply cwd filter when present (cursor/pagination not yet implemented).
+        let list_params: Option<SessionListParams> =
             params.and_then(|p| serde_json::from_value(p).ok());
+        let cwd_filter = list_params.and_then(|p| p.cwd);
         let sessions: Vec<SessionInfo> = state
             .sessions
             .iter()
+            .filter(|(_, cwd)| {
+                if let Some(ref filter) = cwd_filter {
+                    cwd.as_deref() == Some(filter.as_str())
+                } else {
+                    true
+                }
+            })
             .map(|(sid, cwd)| SessionInfo {
                 session_id: sid.clone(),
                 cwd: cwd.clone().unwrap_or_default(),

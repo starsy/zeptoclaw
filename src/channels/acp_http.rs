@@ -398,12 +398,20 @@ impl AcpHttpChannel {
                 "initialize must be called before session/list",
             );
         }
-        // Parse params for cwd filter and cursor; currently accepted but not applied.
-        let _list_params: Option<SessionListParams> =
+        // Parse params; apply cwd filter when present (cursor/pagination not yet implemented).
+        let list_params: Option<SessionListParams> =
             params.and_then(|p| serde_json::from_value(p).ok());
+        let cwd_filter = list_params.and_then(|p| p.cwd);
         let sessions: Vec<SessionInfo> = st
             .sessions
             .iter()
+            .filter(|(_, cwd)| {
+                if let Some(ref filter) = cwd_filter {
+                    cwd.as_deref() == Some(filter.as_str())
+                } else {
+                    true
+                }
+            })
             .map(|(sid, cwd)| SessionInfo {
                 session_id: sid.clone(),
                 cwd: cwd.clone().unwrap_or_default(),
@@ -954,21 +962,22 @@ impl Channel for AcpHttpChannel {
 // Free helpers
 // -------------------------------------------------------------------------
 
-/// Extract plain text from ACP prompt content blocks (text blocks only).
+/// Extract plain text from ACP prompt content blocks.
+///
+/// `Text` blocks contribute their text directly. `ResourceLink` blocks
+/// contribute a reference line so the agent is aware of the resource.
 fn prompt_blocks_to_text(blocks: &[PromptContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|b| {
-            if let PromptContentBlock::Text { text } = b {
-                Some(text.clone())
-            } else {
-                None
+    let mut parts: Vec<String> = Vec::new();
+    for b in blocks {
+        match b {
+            PromptContentBlock::Text { text } => parts.push(text.clone()),
+            PromptContentBlock::ResourceLink { uri, name, .. } => {
+                parts.push(format!("[Resource: {} ({})]", name, uri));
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+            _ => {}
+        }
+    }
+    parts.join("\n").trim().to_string()
 }
 
 /// Constant-time string comparison (prevents timing side-channels on auth tokens).

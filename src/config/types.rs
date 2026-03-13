@@ -805,11 +805,22 @@ impl Default for SerialChannelConfig {
     }
 }
 
-/// ACP (Agent Client Protocol) stdio channel configuration.
+/// ACP (Agent Client Protocol) channel configuration.
+///
+/// **Gateway mode (`zeptoclaw gateway`):** `enabled` has no effect here.
+/// The ACP stdio transport is exclusively for `zeptoclaw acp`, where the process
+/// is spawned as a subprocess by an ACP client (e.g. `acpx`). To expose ACP in
+/// gateway mode, set `channels.acp.http.enabled = true` instead.
+///
+/// **`zeptoclaw acp`:** reads `allow_from`, `deny_by_default`, and `http` from
+/// this config. The `enabled` field is accepted but ignored (the subcommand always
+/// runs ACP stdio regardless).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AcpChannelConfig {
-    /// Whether the ACP channel is enabled.
+    /// Accepted for backward compatibility but has no effect in gateway mode.
+    /// `zeptoclaw acp` always starts ACP stdio regardless of this flag.
+    #[serde(default)]
     pub enabled: bool,
     /// Protocol version to advertise (e.g. "2024-11-05"). Default from ACP spec.
     pub protocol_version: String,
@@ -839,10 +850,10 @@ impl Default for AcpChannelConfig {
 
 /// ACP streamable HTTP transport configuration.
 ///
-/// When `channels.acp.http.enabled` is true (and `channels.acp.enabled` is also
-/// true), ZeptoClaw starts an HTTP listener that accepts JSON-RPC 2.0 messages
-/// via `POST /acp`. `session/prompt` responses are streamed back as
-/// Server-Sent Events; all other methods return synchronous JSON responses.
+/// When `channels.acp.http.enabled` is true, the gateway registers an HTTP
+/// listener that accepts JSON-RPC 2.0 messages via `POST /acp`. `session/prompt`
+/// responses are streamed back as Server-Sent Events; all other methods return
+/// synchronous JSON responses. `channels.acp.enabled` is not required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AcpHttpConfig {

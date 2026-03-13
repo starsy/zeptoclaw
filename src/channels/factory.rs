@@ -9,7 +9,6 @@ use crate::bus::MessageBus;
 use crate::config::{Config, MemoryBackend};
 use crate::providers::{configured_provider_models, configured_provider_names};
 
-use super::acp::AcpChannel;
 use super::acp_http::AcpHttpChannel;
 use super::email_channel::EmailChannel;
 use super::lark::LarkChannel;
@@ -272,45 +271,40 @@ pub async fn register_configured_channels(
         }
     }
 
-    // ACP (Agent Client Protocol) stdio + optional HTTP transport
+    // ACP (Agent Client Protocol) — HTTP transport only in gateway mode.
+    // The ACP stdio transport is exclusively for the `zeptoclaw acp` subcommand
+    // (where the process is spawned as a subprocess by an ACP client). Registering
+    // it here would consume the gateway process's own stdin, which is never a valid
+    // ACP client connection. Use `channels.acp.http` to expose ACP in gateway mode.
     if let Some(ref acp_config) = config.channels.acp {
         if acp_config.enabled {
-            let base_config = BaseChannelConfig {
-                name: "acp".to_string(),
-                allowlist: acp_config.allow_from.clone(),
-                deny_by_default: acp_config.deny_by_default,
-            };
-            manager
-                .register(Box::new(AcpChannel::new(
-                    acp_config.clone(),
-                    base_config,
-                    bus.clone(),
-                )))
-                .await;
-            info!("Registered ACP channel (stdio)");
-
-            // HTTP transport — registered as a separate channel ("acp_http") so
-            // that sessions are independent and bus routing is unambiguous.
-            if let Some(ref http_cfg) = acp_config.http {
-                if http_cfg.enabled {
-                    let http_base = BaseChannelConfig {
-                        name: "acp_http".to_string(),
-                        allowlist: acp_config.allow_from.clone(),
-                        deny_by_default: acp_config.deny_by_default,
-                    };
-                    manager
-                        .register(Box::new(AcpHttpChannel::new(
-                            acp_config.clone(),
-                            http_cfg.clone(),
-                            http_base,
-                            bus.clone(),
-                        )))
-                        .await;
-                    info!(
-                        "Registered ACP channel (HTTP on {}:{})",
-                        http_cfg.bind, http_cfg.port
-                    );
-                }
+            warn!(
+                "channels.acp.enabled has no effect in gateway mode; \
+                 ACP stdio is only used by `zeptoclaw acp`. \
+                 To expose ACP in gateway mode, set channels.acp.http.enabled = true."
+            );
+        }
+        // HTTP transport — registered as a separate channel ("acp_http") so that
+        // sessions are independent and bus routing is unambiguous.
+        if let Some(ref http_cfg) = acp_config.http {
+            if http_cfg.enabled {
+                let http_base = BaseChannelConfig {
+                    name: "acp_http".to_string(),
+                    allowlist: acp_config.allow_from.clone(),
+                    deny_by_default: acp_config.deny_by_default,
+                };
+                manager
+                    .register(Box::new(AcpHttpChannel::new(
+                        acp_config.clone(),
+                        http_cfg.clone(),
+                        http_base,
+                        bus.clone(),
+                    )))
+                    .await;
+                info!(
+                    "Registered ACP channel (HTTP on {}:{})",
+                    http_cfg.bind, http_cfg.port
+                );
             }
         }
     }
@@ -403,7 +397,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_configured_channels_registers_acp() {
+    async fn test_register_configured_channels_acp_enabled_alone_registers_nothing() {
+        // channels.acp.enabled is a no-op in gateway mode (stdio is only for
+        // `zeptoclaw acp`). Setting it without an HTTP config must not register
+        // any channel.
         let bus = Arc::new(MessageBus::new());
         let mut config = Config::default();
         config.channels.acp = Some(AcpChannelConfig {
@@ -417,8 +414,8 @@ mod tests {
         let manager = ChannelManager::new(bus.clone(), config.clone());
         let count = register_configured_channels(&manager, bus, &config).await;
 
-        assert_eq!(count, 1);
-        assert!(manager.has_channel("acp").await);
+        assert_eq!(count, 0);
+        assert!(!manager.has_channel("acp").await);
     }
 
     #[tokio::test]
@@ -428,8 +425,8 @@ mod tests {
         let mut config = Config::default();
         // Use port 0 so the OS assigns an ephemeral port; the channel is
         // registered but start() is not called in this test.
+        // Note: channels.acp.enabled is not required for HTTP registration.
         config.channels.acp = Some(AcpChannelConfig {
-            enabled: true,
             http: Some(AcpHttpConfig {
                 enabled: true,
                 port: 0,
@@ -441,8 +438,11 @@ mod tests {
         let manager = ChannelManager::new(bus.clone(), config.clone());
         let count = register_configured_channels(&manager, bus, &config).await;
 
-        assert_eq!(count, 2, "both acp (stdio) and acp_http must be registered");
-        assert!(manager.has_channel("acp").await);
+        assert_eq!(
+            count, 1,
+            "only acp_http must be registered; stdio is never registered by gateway"
+        );
+        assert!(!manager.has_channel("acp").await);
         assert!(manager.has_channel("acp_http").await);
     }
 }

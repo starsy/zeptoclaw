@@ -212,28 +212,27 @@ Config lives under `channels.acp` (`AcpChannelConfig`):
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | If true, register the ACP stdio channel when the gateway starts. |
+| `enabled` | bool | false | **No-op in gateway mode.** Accepted for backward compatibility; `zeptoclaw acp` always starts ACP stdio regardless of this flag. |
 | `protocol_version` | string | `"2024-11-05"` | Stored but not used: `initialize` always advertises `protocolVersion: 1` (integer) per the ACP schema. |
 | `allow_from` | list of string | [] | If non-empty, only these sender IDs are allowed. |
 | `deny_by_default` | bool | false | If true, empty `allow_from` rejects all senders. |
-| `http` | `AcpHttpConfig` or null | null | HTTP transport config (see below). |
+| `http` | `AcpHttpConfig` or null | null | HTTP transport config (see below). `channels.acp.enabled` is not required for HTTP. |
 
 ### HTTP transport (`channels.acp.http`)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | If true (and `channels.acp.enabled` is also true), start the HTTP listener. |
+| `enabled` | bool | false | If true, register the ACP HTTP listener in gateway mode. `channels.acp.enabled` is not required. |
 | `port` | u16 | 8765 | TCP port to listen on. |
 | `bind` | string | `"127.0.0.1"` | Bind address. Use `"0.0.0.0"` to expose on all interfaces. |
 | `auth_token` | string or null | null | When set, all requests must carry `Authorization: Bearer <token>`. |
 
-**Example config:**
+**Example config (HTTP in gateway mode):**
 
 ```json
 {
   "channels": {
     "acp": {
-      "enabled": true,
       "http": {
         "enabled": true,
         "port": 8765,
@@ -244,6 +243,8 @@ Config lives under `channels.acp` (`AcpChannelConfig`):
   }
 }
 ```
+
+`channels.acp.enabled` is not required for HTTP. For `zeptoclaw acp` (stdio), no config flag is needed — just run the subcommand. `allow_from` and `deny_by_default` apply to both transports.
 
 Allowlist/deny is applied via `BaseChannelConfig` built from `allow_from` and `deny_by_default`. Both the stdio and HTTP transports inherit the same allowlist. In the typical single-client setup, `allow_from` is empty and `deny_by_default` is false.
 

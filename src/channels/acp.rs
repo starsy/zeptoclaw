@@ -292,7 +292,7 @@ impl AcpChannel {
                     id: id.clone(),
                     result: None,
                     error: Some(super::acp_protocol::JsonRpcError {
-                        code: -32602,
+                        code: -32000,
                         message: format!("ACP: unknown session {}", session_id),
                         data: None,
                     }),
@@ -640,6 +640,30 @@ impl AcpChannel {
         out.write_all(line.as_bytes()).await?;
         out.write_all(b"\n").await?;
         out.flush().await?;
+        Ok(())
+    }
+}
+
+impl AcpChannel {
+    /// Run the ACP stdio loop directly, blocking until stdin closes or an error
+    /// occurs.  Use this instead of `start()` when the caller owns the process
+    /// lifecycle (e.g. the `zeptoclaw acp` CLI subcommand).
+    pub async fn run_stdio(self) -> Result<()> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Err(ZeptoError::Channel("ACP channel already running".into()));
+        }
+        info!("ACP channel started (stdio)");
+        Self::run_stdin_loop(
+            self.bus.clone(),
+            self.state.clone(),
+            self.stdout.clone(),
+            self.config.clone(),
+            self.base_config.clone(),
+            self.running.clone(),
+        )
+        .await?;
+        self.running.store(false, Ordering::SeqCst);
+        info!("ACP: stdin loop exited");
         Ok(())
     }
 }

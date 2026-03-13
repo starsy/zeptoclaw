@@ -280,6 +280,8 @@ enum Commands {
         #[arg(long)]
         http: Option<String>,
     },
+    /// Start ACP agent on stdio (for use with acpx or any ACP client)
+    Acp,
 }
 
 #[derive(Subcommand)]
@@ -697,7 +699,45 @@ pub async fn run() -> Result<()> {
         Some(Commands::McpServer { http }) => {
             cmd_mcp_server(http).await?;
         }
+        Some(Commands::Acp) => {
+            cmd_acp().await?;
+        }
     }
+
+    Ok(())
+}
+
+/// Run the ACP stdio agent (JSON-RPC over stdin/stdout).
+///
+/// Starts the full agent kernel then hands control to the ACP stdio loop.
+/// Compatible with `acpx --agent 'zeptoclaw acp'` and any other ACP client.
+async fn cmd_acp() -> Result<()> {
+    use std::sync::Arc;
+
+    use zeptoclaw::bus::MessageBus;
+    use zeptoclaw::{AcpChannel, BaseChannelConfig, Config};
+
+    let config = tokio::task::spawn_blocking(Config::load)
+        .await
+        .map_err(|e| anyhow::anyhow!("Config loader task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {e}"))?;
+
+    // Build ACP config: enabled by default for standalone mode regardless of
+    // what the config file says, inheriting all other fields (allow_from, etc).
+    let mut acp_config = config.channels.acp.clone().unwrap_or_default();
+    acp_config.enabled = true;
+
+    let bus = Arc::new(MessageBus::new());
+
+    // Boot the kernel so the agent loop and LLM provider are ready.
+    let kernel = zeptoclaw::kernel::ZeptoKernel::boot(config, Arc::clone(&bus), None, None).await?;
+    let _kernel = Arc::new(kernel);
+
+    let base_config = BaseChannelConfig::default();
+    let channel = AcpChannel::new(acp_config, base_config, bus);
+    // run_stdio() blocks until stdin closes — keeps the process alive for the
+    // full session rather than returning immediately like start() would.
+    channel.run_stdio().await?;
 
     Ok(())
 }

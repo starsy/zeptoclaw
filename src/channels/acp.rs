@@ -111,11 +111,6 @@ impl AcpChannel {
         let line = serde_json::to_string(response).map_err(|e| {
             ZeptoError::Channel(format!("ACP: failed to serialize response: {}", e))
         })?;
-        if line.contains('\n') {
-            return Err(ZeptoError::Channel(
-                "ACP: response must not contain newlines".into(),
-            ));
-        }
         let mut out = self.stdout.lock().await;
         out.write_all(line.as_bytes()).await?;
         out.write_all(b"\n").await?;
@@ -786,8 +781,8 @@ impl AcpChannel {
             self.running.clone(),
         )
         .await?;
-        self.running.store(false, Ordering::SeqCst);
-        info!("ACP: stdin loop exited");
+        // running.store(false) and the exit log are already done inside
+        // run_stdin_loop; no need to repeat them here.
         Ok(())
     }
 }

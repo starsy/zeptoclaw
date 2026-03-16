@@ -37,27 +37,36 @@ fn bin() -> &'static str {
 
 /// Stable path to the `acpx` binary installed via `npm install -g acpx`.
 fn acpx_bin() -> Option<String> {
-    let candidates = [
-        // fnm global install path (Linux x86_64)
-        "/home/ec2-user/.local/share/fnm/node-versions/v24.14.0/installation/bin/acpx",
-        // nvm global install path
-        "/home/ec2-user/.nvm/versions/node/current/bin/acpx",
-        // system npm global
-        "/usr/local/bin/acpx",
-        "/usr/bin/acpx",
-    ];
-    for p in &candidates {
-        if std::path::Path::new(p).exists() {
-            return Some(p.to_string());
-        }
-    }
-    // fallback: resolve via PATH
+    // Prefer PATH / shim resolution (covers fnm shims, nvm, system npm).
     if let Ok(out) = std::process::Command::new("which").arg("acpx").output() {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !p.is_empty() {
                 return Some(p);
             }
+        }
+    }
+    // Scan fnm node-versions directory without assuming a specific Node version.
+    if let Ok(home) = std::env::var("HOME") {
+        let fnm_base = std::path::PathBuf::from(&home).join(".local/share/fnm/node-versions");
+        if let Ok(entries) = std::fs::read_dir(&fnm_base) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("installation/bin/acpx");
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        // nvm as a last home-relative fallback.
+        let nvm = format!("{}/.nvm/versions/node/current/bin/acpx", home);
+        if std::path::Path::new(&nvm).exists() {
+            return Some(nvm);
+        }
+    }
+    // Fixed system locations.
+    for p in ["/usr/local/bin/acpx", "/usr/bin/acpx"] {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
         }
     }
     None

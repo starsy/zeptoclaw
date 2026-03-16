@@ -1,6 +1,6 @@
 //! Agent command handlers (interactive + stdin mode).
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -15,6 +15,7 @@ use zeptoclaw::health::UsageMetrics;
 use zeptoclaw::providers::{
     configured_provider_names, resolve_runtime_provider, RUNTIME_SUPPORTED_PROVIDERS,
 };
+use zeptoclaw::tools::approval::{ApprovalRequest, ApprovalResponse};
 
 use super::common::{create_agent, create_agent_with_template, resolve_template};
 use super::slash::SlashHelper;
@@ -22,6 +23,8 @@ use super::slash::SlashHelper;
 const CLI_CHANNEL: &str = "cli";
 const CLI_SENDER_ID: &str = "user";
 const CLI_CHAT_ID: &str = "cli";
+const INTERACTIVE_CLI_METADATA_KEY: &str = "interactive_cli";
+const TRUSTED_LOCAL_SESSION_METADATA_KEY: &str = "trusted_local_session";
 
 fn cli_inbound_message(content: &str) -> InboundMessage {
     InboundMessage::new(CLI_CHANNEL, CLI_SENDER_ID, CLI_CHAT_ID, content)
@@ -61,16 +64,72 @@ fn format_tool_list(tool_names: &[&str]) -> String {
     out.trim_end().to_string()
 }
 
+fn prompt_cli_approval(request: ApprovalRequest) -> ApprovalResponse {
+    let args_display = serde_json::to_string_pretty(&request.arguments)
+        .unwrap_or_else(|_| request.arguments.to_string());
+
+    println!();
+    println!("[Approval Required]");
+    println!("Tool: {}", request.tool_name);
+    println!("Arguments:\n{}", args_display);
+    println!();
+
+    loop {
+        print!("Approve execution? [y/N]: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        match io::stdin().lock().read_line(&mut input) {
+            Ok(0) => {
+                return ApprovalResponse::Denied(
+                    "Approval prompt closed before a response was provided.".to_string(),
+                );
+            }
+            Ok(_) => match input.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => return ApprovalResponse::Approved,
+                "" | "n" | "no" => {
+                    return ApprovalResponse::Denied("Execution not approved.".to_string());
+                }
+                _ => {
+                    println!("Please answer 'yes' or 'no'.");
+                }
+            },
+            Err(e) => {
+                return ApprovalResponse::Denied(format!(
+                    "Failed to read approval response: {}",
+                    e
+                ));
+            }
+        }
+    }
+}
+
+fn is_interactive_cli_terminal(stdin_terminal: bool, stdout_terminal: bool) -> bool {
+    stdin_terminal && stdout_terminal
+}
+
+fn has_interactive_cli_terminal() -> bool {
+    is_interactive_cli_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())
+}
+
 /// Interactive or single-message agent mode.
 pub(crate) async fn cmd_agent(
     message: Option<String>,
     template_name: Option<String>,
-    stream: bool,
+    no_stream: bool,
     dry_run: bool,
     mode: Option<String>,
 ) -> Result<()> {
     // Load configuration
     let mut config = Config::load().with_context(|| "Failed to load configuration")?;
+
+    // In CLI mode, default workspace to CWD so file tools resolve relative
+    // paths against the directory the user ran the command from.
+    if config.agents.defaults.workspace == "~/.zeptoclaw/workspace" {
+        if let Ok(cwd) = std::env::current_dir() {
+            config.agents.defaults.workspace = cwd.to_string_lossy().to_string();
+        }
+    }
 
     // Override agent mode from CLI flag if provided
     if let Some(ref mode_str) = mode {
@@ -200,7 +259,12 @@ pub(crate) async fn cmd_agent(
     if let Some(msg) = message {
         // Single message mode
         let inbound = cli_inbound_message(&msg);
-        let streaming = stream || config.agents.defaults.streaming;
+        // Streaming is ON by default; --no-stream disables it.
+        // Config `streaming: false` also disables unless overridden.
+        let streaming = !no_stream && config.agents.defaults.streaming;
+
+        let metrics = agent.metrics_collector();
+        let wall_start = std::time::Instant::now();
 
         if streaming {
             use zeptoclaw::providers::StreamEvent;
@@ -238,6 +302,13 @@ pub(crate) async fn cmd_agent(
                 }
             }
         }
+
+        // Print response metadata footer
+        let wall_elapsed = wall_start.elapsed();
+        let (tokens_in, tokens_out) = metrics.total_tokens();
+        let total_tokens = tokens_in + tokens_out;
+        let tool_calls = metrics.total_tool_calls();
+        super::shimmer::print_metadata_footer(total_tokens, tool_calls, wall_elapsed);
     } else {
         // Interactive mode with rustyline (tab completion for slash commands)
         println!("ZeptoClaw Interactive Agent");
@@ -249,20 +320,41 @@ pub(crate) async fn cmd_agent(
         let mut model_override: Option<(Option<String>, String)> = None; // (provider, model)
         let mut persona_override: Option<String> = None;
 
-        // Try rustyline; fall back to raw stdin if terminal is unavailable.
-        let mut rl = match Editor::new() {
-            Ok(mut editor) => {
-                editor.set_helper(Some(SlashHelper::new()));
-                // Persist history across sessions
-                let history_path =
-                    dirs::home_dir().map(|h| h.join(".zeptoclaw/state/repl_history"));
-                if let Some(ref path) = history_path {
-                    let _ = editor.load_history(path);
+        let interactive_cli = has_interactive_cli_terminal();
+        // Try rustyline for interactive terminals; fall back to raw stdin if line editing
+        // is unavailable or terminal support is limited.
+        let mut rl = if interactive_cli {
+            match Editor::new() {
+                Ok(mut editor) => {
+                    editor.set_helper(Some(SlashHelper::new()));
+                    // Persist history across sessions
+                    let history_path =
+                        dirs::home_dir().map(|h| h.join(".zeptoclaw/state/repl_history"));
+                    if let Some(ref path) = history_path {
+                        let _ = editor.load_history(path);
+                    }
+                    Some((editor, history_path))
                 }
-                Some((editor, history_path))
+                Err(_) => None,
             }
-            Err(_) => None,
+        } else {
+            None
         };
+        let mut trusted_session = false;
+
+        if interactive_cli {
+            agent
+                .set_approval_handler(|request| async move {
+                    match tokio::task::spawn_blocking(move || prompt_cli_approval(request)).await {
+                        Ok(response) => response,
+                        Err(e) => ApprovalResponse::Denied(format!(
+                            "Interactive approval prompt failed: {}",
+                            e
+                        )),
+                    }
+                })
+                .await;
+        }
 
         loop {
             let input = if let Some((ref mut editor, _)) = rl {
@@ -278,8 +370,8 @@ pub(crate) async fn cmd_agent(
                     }
                 }
             } else {
-                // Fallback: raw stdin (piped/non-TTY) — no prompt to avoid
-                // contaminating piped output.
+                // Fallback: raw stdin for non-interactive input or terminals where
+                // line editing is unavailable.
                 let mut buf = String::new();
                 match io::stdin().lock().read_line(&mut buf) {
                     Ok(0) => {
@@ -449,6 +541,36 @@ pub(crate) async fn cmd_agent(
                         }
                         continue;
                     }
+                    "trust" => {
+                        if interactive_cli {
+                            let status = if trusted_session { "ON" } else { "OFF" };
+                            println!("Trusted local session is {}.", status);
+                            if !trusted_session {
+                                println!(
+                                    "Use /trust on to bypass approval prompts for this local interactive CLI session."
+                                );
+                            }
+                        } else {
+                            println!("Trusted session override is only available in interactive CLI mode.");
+                        }
+                        continue;
+                    }
+                    "trust on" => {
+                        if interactive_cli {
+                            trusted_session = true;
+                            println!(
+                                "Trusted local session enabled for this interactive CLI session."
+                            );
+                        } else {
+                            println!("Trusted session override is only available in interactive CLI mode.");
+                        }
+                        continue;
+                    }
+                    "trust off" => {
+                        trusted_session = false;
+                        println!("Trusted local session disabled.");
+                        continue;
+                    }
                     _ => {
                         eprintln!("Unknown command: /{}", cmd);
                         eprintln!("Type /help to see available commands.");
@@ -465,6 +587,12 @@ pub(crate) async fn cmd_agent(
 
             // Process message through agent, injecting any active overrides
             let mut inbound = cli_inbound_message(input);
+            if interactive_cli {
+                inbound = inbound.with_metadata(INTERACTIVE_CLI_METADATA_KEY, "true");
+                if trusted_session {
+                    inbound = inbound.with_metadata(TRUSTED_LOCAL_SESSION_METADATA_KEY, "true");
+                }
+            }
             if let Some((ref provider, ref model)) = model_override {
                 inbound = inbound.with_metadata("model_override", model);
                 if let Some(ref p) = provider {
@@ -474,7 +602,7 @@ pub(crate) async fn cmd_agent(
             if let Some(ref persona) = persona_override {
                 inbound = inbound.with_metadata("persona_override", persona);
             }
-            let streaming = stream || config.agents.defaults.streaming;
+            let streaming = !no_stream && config.agents.defaults.streaming;
 
             if streaming {
                 use zeptoclaw::providers::StreamEvent;
@@ -725,5 +853,13 @@ mod tests {
         let list =
             zeptoclaw::channels::model_switch::format_model_list(&providers, current.as_ref(), &[]);
         assert!(list.contains("gpt-5.1 GPT-5.1 (current)"));
+    }
+
+    #[test]
+    fn test_has_interactive_cli_terminal_requires_stdin_and_stdout_tty() {
+        assert!(is_interactive_cli_terminal(true, true));
+        assert!(!is_interactive_cli_terminal(true, false));
+        assert!(!is_interactive_cli_terminal(false, true));
+        assert!(!is_interactive_cli_terminal(false, false));
     }
 }

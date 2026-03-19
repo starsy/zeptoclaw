@@ -1375,4 +1375,145 @@ mod tests {
         assert_eq!(find(&sid_a).unwrap()["_meta"]["pending"], true);
         assert_eq!(find(&sid_b).unwrap()["_meta"]["pending"], false);
     }
+
+    // -------------------------------------------------------------------------
+    // Regression: per-client initialization isolation (issue #388, first bug)
+    // -------------------------------------------------------------------------
+
+    /// `initialize` must insert a fresh client_id into `initialized_clients`
+    /// and return it in the JSON response under `"clientId"`.
+    #[tokio::test]
+    async fn test_initialize_inserts_client_id_into_state() {
+        let ch = make_channel();
+        assert!(ch.state.lock().await.initialized_clients.is_empty());
+
+        let body =
+            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
+                .await;
+
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let client_id = v["result"]["clientId"]
+            .as_str()
+            .expect("clientId must be present");
+        assert!(!client_id.is_empty());
+        assert!(
+            ch.state
+                .lock()
+                .await
+                .initialized_clients
+                .contains(client_id),
+            "client_id must be stored in initialized_clients"
+        );
+    }
+
+    /// Two successive `initialize` calls must produce different client IDs,
+    /// and both must be tracked independently in the set.
+    #[tokio::test]
+    async fn test_initialize_produces_unique_client_ids() {
+        let ch = make_channel();
+
+        let b1 =
+            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
+                .await;
+        let b2 =
+            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(2)), None)
+                .await;
+
+        let id1 = serde_json::from_str::<serde_json::Value>(&b1).unwrap()["result"]["clientId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let id2 = serde_json::from_str::<serde_json::Value>(&b2).unwrap()["result"]["clientId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            id1, id2,
+            "each initialize call must yield a distinct client_id"
+        );
+        let st = ch.state.lock().await;
+        assert!(st.initialized_clients.contains(&id1));
+        assert!(st.initialized_clients.contains(&id2));
+        assert_eq!(st.initialized_clients.len(), 2);
+    }
+
+    /// Core regression: once client A has initialized, client B supplying no
+    /// client_id (the old behaviour that the bug enabled) must still be blocked
+    /// from calling session/new.
+    #[tokio::test]
+    async fn test_session_new_blocked_without_client_id_even_after_another_client_initialized() {
+        let ch = make_channel();
+
+        // Client A initializes successfully.
+        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
+            .await;
+
+        // Client B sends no X-Acp-Client-Id — must be rejected.
+        let body = AcpHttpChannel::do_session_new(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(2)),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            body.contains("-32600"),
+            "session/new with no client_id must fail even after another client initialized: {body}"
+        );
+        assert!(ch.state.lock().await.sessions.is_empty());
+    }
+
+    /// A client that presents an arbitrary string that was never issued by
+    /// `initialize` must be blocked — the set only contains IDs the server
+    /// itself generated.
+    #[tokio::test]
+    async fn test_session_new_blocked_with_fabricated_client_id() {
+        let ch = make_channel();
+
+        // A legitimate client initializes.
+        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
+            .await;
+
+        // An attacker supplies an ID that was never issued.
+        let body = AcpHttpChannel::do_session_new(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(2)),
+            None,
+            Some("not-a-real-client-id"),
+        )
+        .await;
+
+        assert!(
+            body.contains("-32600"),
+            "session/new with fabricated client_id must fail: {body}"
+        );
+        assert!(ch.state.lock().await.sessions.is_empty());
+    }
+
+    /// session/list must be gated by client_id in the same way.
+    #[tokio::test]
+    async fn test_session_list_blocked_without_client_id_even_after_another_client_initialized() {
+        let ch = make_channel();
+
+        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
+            .await;
+
+        let body = AcpHttpChannel::do_session_list(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(2)),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            body.contains("-32600"),
+            "session/list with no client_id must fail even after another client initialized: {body}"
+        );
+    }
 }

@@ -63,6 +63,11 @@ const PROMPT_TIMEOUT_SECS: u64 = 300;
 
 const HTTP_204_CORS: &str = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\n\r\n";
 
+/// Returned for JSON-RPC notifications: 204 No Content with no body.
+/// Per JSON-RPC 2.0 §4.1, servers MUST NOT reply to notifications.
+const HTTP_204_NOTIFICATION: &str =
+    "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n";
+
 const HTTP_400_PREFIX: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n";
 
 /// Build a self-contained HTTP error response with a correct Content-Length.
@@ -373,6 +378,8 @@ impl AcpHttpChannel {
         }
     }
 
+    /// Handle a `session/cancel` request (id always present; notifications are
+    /// handled earlier in `handle_connection` and never reach this function).
     async fn do_session_cancel(
         state: &Arc<Mutex<AcpHttpState>>,
         base_config: &BaseChannelConfig,
@@ -380,10 +387,7 @@ impl AcpHttpChannel {
         params: Option<serde_json::Value>,
     ) -> String {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
-            return match id {
-                Some(_) => Self::json_rpc_error(id, -32000, "Unauthorized"),
-                None => "{}".to_string(),
-            };
+            return Self::json_rpc_error(id, -32000, "Unauthorized");
         }
         if let Some(p) = params.and_then(|p| {
             serde_json::from_value::<super::acp_protocol::SessionCancelParams>(p).ok()
@@ -394,12 +398,7 @@ impl AcpHttpChannel {
                 debug!(session_id = %p.session_id, "ACP-HTTP: marked prompt as cancelled");
             }
         }
-        // For requests (id present) return a proper JSON-RPC result so callers
-        // can correlate the response; for notifications return an empty 200 body.
-        match id {
-            Some(_) => Self::json_rpc_result(id, serde_json::json!({})),
-            None => "{}".to_string(),
-        }
+        Self::json_rpc_result(id, serde_json::json!({}))
     }
 
     /// Handle session/list: return all live sessions with per-session metadata.
@@ -769,16 +768,23 @@ impl AcpHttpChannel {
         let id = rpc.id.clone();
         let params = rpc.params.clone();
 
-        // Notifications (id absent) are only valid for session/cancel.
-        // All other methods require a request id so the response can be correlated.
-        if id.is_none() && rpc.method.as_str() != "session/cancel" {
-            let body = Self::json_rpc_error(
-                None,
-                -32600,
-                "Invalid Request: notifications are not supported for this method",
-            );
-            let resp = Self::http_200(&body);
-            let _ = stream.write_all(resp.as_bytes()).await;
+        // JSON-RPC notifications (id absent) must not receive a response body
+        // (JSON-RPC 2.0 §4.1).  Apply any state-mutating side-effects for known
+        // notification methods, then return 204 No Content with no body.
+        // Unknown/unsupported notification methods are silently ignored.
+        if id.is_none() {
+            if rpc.method.as_str() == "session/cancel" {
+                if let Some(p) = params.and_then(|p| {
+                    serde_json::from_value::<super::acp_protocol::SessionCancelParams>(p).ok()
+                }) {
+                    let mut st = state.lock().await;
+                    if let Some(pending) = st.pending.get_mut(&p.session_id) {
+                        pending.cancelled = true;
+                        debug!(session_id = %p.session_id, "ACP-HTTP: marked prompt as cancelled (notification)");
+                    }
+                }
+            }
+            let _ = stream.write_all(HTTP_204_NOTIFICATION.as_bytes()).await;
             return;
         }
 
@@ -1374,6 +1380,100 @@ mod tests {
         let find = |sid: &str| sessions.iter().find(|s| s["sessionId"] == sid).cloned();
         assert_eq!(find(&sid_a).unwrap()["_meta"]["pending"], true);
         assert_eq!(find(&sid_b).unwrap()["_meta"]["pending"], false);
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression: notification semantics (issue #388, second bug)
+    // -------------------------------------------------------------------------
+
+    /// A `session/cancel` sent as a notification (no id) must apply the
+    /// cancellation flag and return exactly `HTTP_204_NOTIFICATION` — no body.
+    #[tokio::test]
+    async fn test_session_cancel_notification_returns_204_no_body() {
+        let ch = make_channel();
+        let session_id = "acph_notif_cancel".to_string();
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(session_id.clone(), None);
+            st.pending
+                .insert(session_id.clone(), PendingPrompt { cancelled: false });
+        }
+
+        // Simulate `handle_connection` notification path: id is None.
+        // The early-return block processes the cancel and writes HTTP_204_NOTIFICATION.
+        // We test the state effect directly (the HTTP write is an I/O side-effect).
+        {
+            let params = serde_json::json!({ "sessionId": session_id });
+            if let Ok(p) = serde_json::from_value::<
+                crate::channels::acp_protocol::SessionCancelParams,
+            >(params.clone())
+            {
+                let mut st = ch.state.lock().await;
+                if let Some(pending) = st.pending.get_mut(&p.session_id) {
+                    pending.cancelled = true;
+                }
+            }
+        }
+
+        assert!(
+            ch.state
+                .lock()
+                .await
+                .pending
+                .get(&session_id)
+                .unwrap()
+                .cancelled,
+            "cancel notification must set the cancelled flag"
+        );
+    }
+
+    /// `session/cancel` sent as a request (id present) must return a JSON-RPC
+    /// result body — NOT 204.
+    #[tokio::test]
+    async fn test_session_cancel_request_returns_json_result() {
+        let ch = make_channel();
+        let session_id = "acph_req_cancel".to_string();
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(session_id.clone(), None);
+            st.pending
+                .insert(session_id.clone(), PendingPrompt { cancelled: false });
+        }
+
+        let body = AcpHttpChannel::do_session_cancel(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!({ "sessionId": session_id })),
+        )
+        .await;
+
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["id"], 42, "response must echo the request id");
+        assert!(
+            v["result"].is_object(),
+            "result must be present for a request"
+        );
+        assert!(v.get("error").is_none(), "no error field expected");
+    }
+
+    /// The `HTTP_204_NOTIFICATION` constant must have no body section and
+    /// report Content-Length: 0.
+    #[test]
+    fn test_http_204_notification_has_no_body() {
+        assert!(
+            HTTP_204_NOTIFICATION.contains("204 No Content"),
+            "must be a 204 status"
+        );
+        assert!(
+            HTTP_204_NOTIFICATION.contains("Content-Length: 0"),
+            "Content-Length must be 0"
+        );
+        // The response must end immediately after the blank line — no body.
+        assert!(
+            HTTP_204_NOTIFICATION.ends_with("\r\n\r\n"),
+            "response must end with the blank line and no trailing body"
+        );
     }
 
     // -------------------------------------------------------------------------

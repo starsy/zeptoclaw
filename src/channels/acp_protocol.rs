@@ -64,9 +64,9 @@ pub struct ClientInfo {
 /// Generate a new unique identifier for ACP sessions and client tokens.
 ///
 /// All ACP ID generation goes through this function so the scheme can be
-/// swapped project-wide (e.g. to ULID) by changing only this one place.
+/// swapped project-wide by changing only this one place.
 pub fn new_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+    ulid::Ulid::new().to_string()
 }
 
 /// initialize result.

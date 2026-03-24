@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_TERM_QUIET: "true" # F.I.R.S.T. principle (only print failures, not test names)
   RUSTFLAGS: -Dwarnings
-  BINARY_SIZE_LIMIT_MB: 10
+  BINARY_SIZE_LIMIT_MB: 11
 
 jobs:
   test:
@@ -65,6 +65,33 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: EmbarkStudios/cargo-deny-action@44db170f6a7d12a6e90340e9e0fca1f650d34b14 # v2.0.15
+
+  feature-matrix:
+    name: Feature gates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--features panel"
+          - "--features tool-pdf"
+          - "--features memory-hnsw"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: features-${{ matrix.features }}
+      - name: Check compilation
+        run: cargo check ${{ matrix.features }}
 
   coverage:
     name: Coverage

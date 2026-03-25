@@ -600,24 +600,34 @@ async fn test_session_cancel_sends_no_response() {
     }))
     .await;
 
-    // A bounded read must time out: the server must not respond to a notification.
-    let stray = conn.try_recv().await;
-    assert!(
-        stray.is_none(),
-        "server must not send a response to session/cancel (notification), got: {stray:?}"
-    );
-
-    // Channel must still be usable after a cancel.
+    // Send a sentinel request immediately after.  Because the server processes
+    // stdin sequentially, the sentinel response can only arrive after cancel has
+    // been fully handled.  We collect every message that arrives before (and
+    // including) the sentinel: if the server emitted anything for cancel it will
+    // show up as a stray in that window.
     conn.send(serde_json::json!({
         "jsonrpc": "2.0", "id": 90,
         "method": "session/list",
         "params": {}
     }))
     .await;
-    let resp = conn.recv_for_id(&serde_json::json!(90)).await;
+    let sentinel_id = serde_json::json!(90);
+    let mut strays: Vec<serde_json::Value> = Vec::new();
+    let sentinel = loop {
+        let msg = conn.recv().await;
+        if msg.get("id") == Some(&sentinel_id) {
+            break msg;
+        }
+        strays.push(msg);
+    };
     assert!(
-        resp.get("result").is_some(),
-        "session/list after cancel must still succeed; got: {resp}"
+        strays.is_empty(),
+        "server must not send a response to session/cancel (notification); \
+         got unexpected messages before sentinel: {strays:?}"
+    );
+    assert!(
+        sentinel.get("result").is_some(),
+        "sentinel session/list after cancel must succeed; got: {sentinel}"
     );
     conn.shutdown().await;
 }

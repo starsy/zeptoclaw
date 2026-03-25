@@ -724,8 +724,6 @@ impl AcpChannel {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             }),
             auth_methods: vec![],
-            // stdio is single-client; no per-connection token needed.
-            client_id: None,
         };
         let response =
             JsonRpcResponse {

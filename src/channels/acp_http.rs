@@ -19,7 +19,7 @@
 //! independent from the stdio `"acp"` channel and the bus routes outbound
 //! messages to the correct transport.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,14 +97,6 @@ type PromptMap = Arc<Mutex<HashMap<String, oneshot::Sender<(String, bool)>>>>;
 
 /// Mutable per-channel ACP state shared between the accept loop and `send()`.
 struct AcpHttpState {
-    /// Client IDs that have completed the `initialize` handshake.
-    ///
-    /// Each HTTP client receives a unique ID from `initialize` (via the
-    /// `clientId` response field) and must echo it back as the
-    /// `X-Acp-Client-Id` request header on subsequent calls.  Using a set
-    /// here rather than a single bool isolates concurrent clients so that
-    /// one client's initialization does not satisfy another's guard check.
-    initialized_clients: HashSet<String>,
     /// Session IDs → working directory (from session/new params, None if not provided).
     sessions: HashMap<String, Option<String>>,
     /// Tracks in-flight session/prompt requests so `send()` can retrieve the
@@ -115,7 +107,6 @@ struct AcpHttpState {
 impl AcpHttpState {
     fn new() -> Self {
         Self {
-            initialized_clients: HashSet::new(),
             sessions: HashMap::new(),
             pending: HashMap::new(),
         }
@@ -290,7 +281,6 @@ impl AcpHttpChannel {
     // -------------------------------------------------------------------------
 
     async fn do_initialize(
-        state: &Arc<Mutex<AcpHttpState>>,
         _config: &AcpChannelConfig,
         id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
@@ -305,11 +295,6 @@ impl AcpHttpChannel {
                     "ACP-HTTP: client initialized"
                 );
             }
-        }
-        let client_id = super::acp_protocol::new_id();
-        {
-            let mut st = state.lock().await;
-            st.initialized_clients.insert(client_id.clone());
         }
         let result = InitializeResult {
             protocol_version: serde_json::json!(1),
@@ -331,7 +316,6 @@ impl AcpHttpChannel {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             }),
             auth_methods: vec![],
-            client_id: Some(client_id),
         };
         match serde_json::to_value(result) {
             Ok(v) => Self::json_rpc_result(id, v),
@@ -344,7 +328,6 @@ impl AcpHttpChannel {
         base_config: &BaseChannelConfig,
         id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
-        client_id: Option<&str>,
     ) -> String {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
             return Self::json_rpc_error(id, -32000, "Unauthorized");
@@ -355,13 +338,6 @@ impl AcpHttpChannel {
         let session_id = format!("acph_{}", super::acp_protocol::new_id());
         {
             let mut st = state.lock().await;
-            if !st.initialized_clients.contains(client_id.unwrap_or("")) {
-                return Self::json_rpc_error(
-                    id,
-                    -32600,
-                    "initialize must be called before session/new",
-                );
-            }
             if st.sessions.len() >= MAX_ACP_SESSIONS {
                 return Self::json_rpc_error(
                     id,
@@ -407,19 +383,11 @@ impl AcpHttpChannel {
         base_config: &BaseChannelConfig,
         id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
-        client_id: Option<&str>,
     ) -> String {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
             return Self::json_rpc_error(id, -32000, "Unauthorized");
         }
         let st = state.lock().await;
-        if !st.initialized_clients.contains(client_id.unwrap_or("")) {
-            return Self::json_rpc_error(
-                id,
-                -32600,
-                "initialize must be called before session/list",
-            );
-        }
         // Parse params; apply cwd filter when present (cursor/pagination not yet implemented).
         let list_params: Option<SessionListParams> = match params {
             None => None,
@@ -475,20 +443,9 @@ impl AcpHttpChannel {
         bus: &Arc<MessageBus>,
         id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
-        client_id: Option<&str>,
     ) -> Result<std::result::Result<(String, oneshot::Receiver<(String, bool)>), String>> {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
             return Ok(Err(Self::json_rpc_error(id, -32000, "Unauthorized")));
-        }
-        {
-            let st = state.lock().await;
-            if !st.initialized_clients.contains(client_id.unwrap_or("")) {
-                return Ok(Err(Self::json_rpc_error(
-                    id,
-                    -32600,
-                    "initialize must be called before session/prompt",
-                )));
-            }
         }
         let params: super::acp_protocol::SessionPromptParams =
             match params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -663,40 +620,57 @@ impl AcpHttpChannel {
         pending_http: PromptMap,
     ) {
         // Read the full request (headers + body) with a per-request size cap.
+        // The outer 30s deadline prevents slow-loris attacks where a client
+        // drips one byte at a time, resetting a per-read timeout indefinitely.
         let mut buf = vec![0u8; MAX_REQUEST_BYTES];
         let mut total = 0usize;
-        loop {
-            if total >= buf.len() {
+        let read_result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if total >= buf.len() {
+                    return Err("payload too large");
+                }
+                match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf[total..]))
+                    .await
+                {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        total += n;
+                        if let Some(hend) = Self::find_header_end(&buf[..total]) {
+                            if let Some(req) = Self::parse_request(&buf[..total]) {
+                                let body_received = total - hend - 4;
+                                if body_received >= Self::content_length(&req.headers) {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("ACP-HTTP: read error: {}", e);
+                        return Err("read error");
+                    }
+                    Err(_) => {
+                        debug!("ACP-HTTP: read timeout");
+                        return Err("read timeout");
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await;
+        match read_result {
+            Ok(Ok(())) => {}
+            Ok(Err("payload too large")) => {
                 let resp =
                     build_http_error("413 Payload Too Large", r#"{"error":"payload too large"}"#);
                 let _ = stream.write_all(resp.as_bytes()).await;
                 return;
             }
-            match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf[total..]))
-                .await
-            {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    total += n;
-                    if let Some(hend) = Self::find_header_end(&buf[..total]) {
-                        if let Some(req) = Self::parse_request(&buf[..total]) {
-                            let body_received = total - hend - 4;
-                            if body_received >= Self::content_length(&req.headers) {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    debug!("ACP-HTTP: read error: {}", e);
-                    return;
-                }
-                Err(_) => {
-                    debug!("ACP-HTTP: read timeout");
-                    return;
-                }
+            Ok(Err(_)) => return,
+            Err(_) => {
+                debug!("ACP-HTTP: total request deadline exceeded (slow-loris?)");
+                return;
             }
         }
         if total == 0 {
@@ -738,14 +712,6 @@ impl AcpHttpChannel {
             let _ = stream.write_all(resp.as_bytes()).await;
             return;
         }
-
-        // Per-client initialization token echoed back from the initialize response.
-        let client_id: Option<String> = req
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("x-acp-client-id"))
-            .map(|(_, v)| v.trim().to_string());
-        let client_id_ref = client_id.as_deref();
 
         // Parse JSON-RPC envelope.
         let rpc: JsonRpcRequest = match serde_json::from_str(&req.body) {
@@ -790,13 +756,12 @@ impl AcpHttpChannel {
 
         match rpc.method.as_str() {
             "initialize" => {
-                let body = Self::do_initialize(&state, &config, id, params).await;
+                let body = Self::do_initialize(&config, id, params).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
             "session/new" => {
-                let body =
-                    Self::do_session_new(&state, &base_config, id, params, client_id_ref).await;
+                let body = Self::do_session_new(&state, &base_config, id, params).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
@@ -806,8 +771,7 @@ impl AcpHttpChannel {
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
             "session/list" => {
-                let body =
-                    Self::do_session_list(&state, &base_config, id, params, client_id_ref).await;
+                let body = Self::do_session_list(&state, &base_config, id, params).await;
                 let resp = Self::http_200(&body);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
@@ -819,7 +783,6 @@ impl AcpHttpChannel {
                     &bus,
                     id.clone(),
                     params,
-                    client_id_ref,
                 )
                 .await
                 {
@@ -1089,15 +1052,18 @@ fn prompt_blocks_to_text(blocks: &[PromptContentBlock]) -> String {
 }
 
 /// Constant-time string comparison (prevents timing side-channels on auth tokens).
+///
+/// Does NOT short-circuit on length mismatch — XORs up to `max(a.len(), b.len())`
+/// bytes so that token length cannot be inferred via timing.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
+    let max_len = a.len().max(b.len());
+    // Fold the length difference into the accumulator so a length mismatch
+    // produces a non-zero result without revealing which side is longer.
+    let mut result = (a.len() ^ b.len()) as u8;
+    for i in 0..max_len {
+        result |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
     result == 0
 }
@@ -1270,17 +1236,11 @@ mod tests {
             base,
             bus,
         );
-        ch.state
-            .lock()
-            .await
-            .initialized_clients
-            .insert("test_client".to_string());
         let result = AcpHttpChannel::do_session_new(
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(1)),
             None,
-            Some("test_client"),
         )
         .await;
         assert!(
@@ -1316,37 +1276,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_list_requires_initialize() {
+    async fn test_session_list_no_sessions() {
         let ch = make_channel();
-        // No client_id supplied → not in initialized_clients → must be rejected.
         let body = AcpHttpChannel::do_session_list(
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(1)),
             None,
-            None,
         )
         .await;
-        assert!(
-            body.contains("-32600"),
-            "session/list before initialize must return -32600"
-        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["sessions"], serde_json::json!([]));
     }
 
     #[tokio::test]
     async fn test_session_list_empty() {
         let ch = make_channel();
-        ch.state
-            .lock()
-            .await
-            .initialized_clients
-            .insert("test_client".to_string());
         let body = AcpHttpChannel::do_session_list(
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(1)),
             None,
-            Some("test_client"),
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1360,7 +1310,6 @@ mod tests {
         let sid_b = "acph_list_b".to_string();
         {
             let mut st = ch.state.lock().await;
-            st.initialized_clients.insert("test_client".to_string());
             st.sessions.insert(sid_a.clone(), None);
             st.sessions.insert(sid_b.clone(), None);
             st.pending
@@ -1371,7 +1320,6 @@ mod tests {
             &ch.base_config,
             Some(serde_json::json!(1)),
             None,
-            Some("test_client"),
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1477,154 +1425,50 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Regression: per-client initialization isolation (issue #388, first bug)
+    // initialize → session/new → session/list round-trip
     // -------------------------------------------------------------------------
 
-    /// `initialize` must insert a fresh client_id into `initialized_clients`
-    /// and return it in the JSON response under `"clientId"`.
+    /// `initialize` must return a well-formed response with the required fields
+    /// and must not include a `clientId` field (not part of the ACP spec).
     #[tokio::test]
-    async fn test_initialize_inserts_client_id_into_state() {
+    async fn test_initialize_returns_spec_fields() {
         let ch = make_channel();
-        assert!(ch.state.lock().await.initialized_clients.is_empty());
-
         let body =
-            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-                .await;
-
+            AcpHttpChannel::do_initialize(&ch.config, Some(serde_json::json!(1)), None).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let client_id = v["result"]["clientId"]
-            .as_str()
-            .expect("clientId must be present");
-        assert!(!client_id.is_empty());
         assert!(
-            ch.state
-                .lock()
-                .await
-                .initialized_clients
-                .contains(client_id),
-            "client_id must be stored in initialized_clients"
+            v["result"]["protocolVersion"].is_number(),
+            "protocolVersion must be present"
         );
-    }
-
-    /// Two successive `initialize` calls must produce different client IDs,
-    /// and both must be tracked independently in the set.
-    #[tokio::test]
-    async fn test_initialize_produces_unique_client_ids() {
-        let ch = make_channel();
-
-        let b1 =
-            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-                .await;
-        let b2 =
-            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(2)), None)
-                .await;
-
-        let id1 = serde_json::from_str::<serde_json::Value>(&b1).unwrap()["result"]["clientId"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let id2 = serde_json::from_str::<serde_json::Value>(&b2).unwrap()["result"]["clientId"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        assert_ne!(
-            id1, id2,
-            "each initialize call must yield a distinct client_id"
-        );
-        let st = ch.state.lock().await;
-        assert!(st.initialized_clients.contains(&id1));
-        assert!(st.initialized_clients.contains(&id2));
-        assert_eq!(st.initialized_clients.len(), 2);
-    }
-
-    /// Core regression: once client A has initialized, client B supplying no
-    /// client_id (the old behaviour that the bug enabled) must still be blocked
-    /// from calling session/new.
-    #[tokio::test]
-    async fn test_session_new_blocked_without_client_id_even_after_another_client_initialized() {
-        let ch = make_channel();
-
-        // Client A initializes successfully.
-        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-            .await;
-
-        // Client B sends no X-Acp-Client-Id — must be rejected.
-        let body = AcpHttpChannel::do_session_new(
-            &ch.state,
-            &ch.base_config,
-            Some(serde_json::json!(2)),
-            None,
-            None,
-        )
-        .await;
-
         assert!(
-            body.contains("-32600"),
-            "session/new with no client_id must fail even after another client initialized: {body}"
+            v["result"]["agentCapabilities"].is_object(),
+            "agentCapabilities must be present"
         );
-        assert!(ch.state.lock().await.sessions.is_empty());
-    }
-
-    /// A client that presents an arbitrary string that was never issued by
-    /// `initialize` must be blocked — the set only contains IDs the server
-    /// itself generated.
-    #[tokio::test]
-    async fn test_session_new_blocked_with_fabricated_client_id() {
-        let ch = make_channel();
-
-        // A legitimate client initializes.
-        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-            .await;
-
-        // An attacker supplies an ID that was never issued.
-        let body = AcpHttpChannel::do_session_new(
-            &ch.state,
-            &ch.base_config,
-            Some(serde_json::json!(2)),
-            None,
-            Some("not-a-real-client-id"),
-        )
-        .await;
-
         assert!(
-            body.contains("-32600"),
-            "session/new with fabricated client_id must fail: {body}"
+            v["result"].get("clientId").is_none(),
+            "clientId must not be in the response"
         );
-        assert!(ch.state.lock().await.sessions.is_empty());
     }
 
-    /// Happy-path round-trip: the `clientId` returned by `initialize` must be
-    /// accepted by `session/new` and produce a valid `sessionId`.
-    ///
-    /// This is the critical positive test that the guard-only tests cannot
-    /// cover: a bug in the JSON key name, value encoding, or HashSet insertion
-    /// would make every real client fail even though the negative tests pass.
+    /// Happy-path round-trip: `initialize` → `session/new` → valid `sessionId`.
     #[tokio::test]
     async fn test_initialize_to_session_new_round_trip() {
         let ch = make_channel();
 
-        let init_body =
-            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-                .await;
-        let init_v: serde_json::Value = serde_json::from_str(&init_body).unwrap();
-        let client_id = init_v["result"]["clientId"]
-            .as_str()
-            .expect("clientId must be present in initialize response");
+        AcpHttpChannel::do_initialize(&ch.config, Some(serde_json::json!(1)), None).await;
 
         let new_body = AcpHttpChannel::do_session_new(
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(2)),
             None,
-            Some(client_id),
         )
         .await;
         let new_v: serde_json::Value = serde_json::from_str(&new_body).unwrap();
 
         assert!(
             new_v.get("error").is_none(),
-            "session/new must succeed with the issued clientId: {new_body}"
+            "session/new must succeed: {new_body}"
         );
         assert!(
             new_v["result"]["sessionId"].as_str().is_some(),
@@ -1632,29 +1476,18 @@ mod tests {
         );
     }
 
-    /// Multi-round positive path: `initialize` → `session/new` → `session/list`,
-    /// all using the same issued `clientId` from the initialize response.
+    /// Multi-round positive path: `initialize` → `session/new` → `session/list`.
     #[tokio::test]
     async fn test_initialize_to_session_new_to_session_list_round_trip() {
         let ch = make_channel();
 
-        // Round 1: initialize.
-        let init_body =
-            AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-                .await;
-        let client_id = serde_json::from_str::<serde_json::Value>(&init_body).unwrap()["result"]
-            ["clientId"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        AcpHttpChannel::do_initialize(&ch.config, Some(serde_json::json!(1)), None).await;
 
-        // Round 2: session/new.
         let new_body = AcpHttpChannel::do_session_new(
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(2)),
             None,
-            Some(&client_id),
         )
         .await;
         let session_id = serde_json::from_str::<serde_json::Value>(&new_body).unwrap()["result"]
@@ -1663,20 +1496,18 @@ mod tests {
             .expect("session/new must succeed")
             .to_string();
 
-        // Round 3: session/list.
         let list_body = AcpHttpChannel::do_session_list(
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(3)),
             None,
-            Some(&client_id),
         )
         .await;
         let list_v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
 
         assert!(
             list_v.get("error").is_none(),
-            "session/list must succeed with the issued clientId: {list_body}"
+            "session/list must succeed: {list_body}"
         );
         let sessions = list_v["result"]["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1, "exactly one session must be listed");
@@ -1687,40 +1518,10 @@ mod tests {
         );
     }
 
-    /// session/list must be gated by client_id in the same way.
-    #[tokio::test]
-    async fn test_session_list_blocked_without_client_id_even_after_another_client_initialized() {
-        let ch = make_channel();
-
-        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-            .await;
-
-        let body = AcpHttpChannel::do_session_list(
-            &ch.state,
-            &ch.base_config,
-            Some(serde_json::json!(2)),
-            None,
-            None,
-        )
-        .await;
-
-        assert!(
-            body.contains("-32600"),
-            "session/list with no client_id must fail even after another client initialized: {body}"
-        );
-    }
-
-    /// `register_prompt` has its own `initialized_clients` guard that is
-    /// exercised independently of `do_session_new` / `do_session_list`.
-    /// Verify it rejects calls with no `clientId` even after another client
-    /// has initialized.
+    /// `register_prompt` must reject calls with an unknown session ID.
     #[tokio::test]
     async fn test_register_prompt_blocked_without_client_id() {
         let ch = make_channel();
-
-        // Another client initializes — must not unlock register_prompt for others.
-        AcpHttpChannel::do_initialize(&ch.state, &ch.config, Some(serde_json::json!(1)), None)
-            .await;
 
         let result = AcpHttpChannel::register_prompt(
             &ch.state,
@@ -1729,22 +1530,21 @@ mod tests {
             &ch.bus,
             Some(serde_json::json!(2)),
             Some(serde_json::json!({
-                "sessionId": "acph_any",
+                "sessionId": "acph_nonexistent",
                 "prompt": [{ "type": "text", "text": "hello" }]
             })),
-            None, // no X-Acp-Client-Id header
         )
         .await
         .expect("register_prompt must not return an Err variant here");
 
         assert!(
             result.is_err(),
-            "register_prompt must reject calls with no clientId"
+            "register_prompt must reject calls with an unknown session"
         );
         let err_body = result.unwrap_err();
         assert!(
-            err_body.contains("-32600"),
-            "rejection must use -32600 (not initialized): {err_body}"
+            err_body.contains("-32600") || err_body.contains("-32000"),
+            "rejection must be an RPC error: {err_body}"
         );
     }
 }

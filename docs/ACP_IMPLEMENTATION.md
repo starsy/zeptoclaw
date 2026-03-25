@@ -14,12 +14,12 @@ ZeptoClaw implements a **minimal** ACP agent surface:
 
 | ACP method / message | Role | Implemented |
 |----------------------|------|--------------|
-| `initialize` | Handshake; client → agent | Yes — sets `initialized` flag, logs client info, returns capabilities |
-| `session/new` | Create session; client → agent | Yes — requires prior `initialize`; stores cwd; capped at 1 000 live sessions |
-| `session/prompt` | Send user prompt; client → agent | Yes — text and ResourceLink blocks; requires `initialize`; in-flight and size guards |
+| `initialize` | Handshake; client → agent | Yes — logs client info, returns capabilities; stdio also sets `initialized` flag |
+| `session/new` | Create session; client → agent | Yes — stores cwd; capped at 1 000 live sessions; stdio enforces prior `initialize` |
+| `session/prompt` | Send user prompt; client → agent | Yes — text and ResourceLink blocks; in-flight and size guards; stdio enforces prior `initialize` |
 | `session/cancel` | Cancel in-flight prompt; client → agent | Yes — notification; validates session existence |
 | `session/update` | Agent progress / result; agent → client | Yes — text chunks for both prompted and proactive replies |
-| `session/list` | List live sessions; client → agent | Yes — returns all sessions with cwd/sessionId/title; supports cwd filter and cursor |
+| `session/list` | List live sessions; client → agent | Yes — returns all sessions with cwd/sessionId/title; supports cwd filter and cursor; stdio enforces prior `initialize` |
 
 Two transports are supported:
 
@@ -128,9 +128,9 @@ No changes were required to the generic bus or agent loop; they only see standar
 
 ### 4.1 initialize
 
-- **Handler:** `handle_initialize` (instance method on `AcpChannel`).
+- **Handler:** `handle_initialize` (stdio) / `do_initialize` (HTTP).
 - **Client info:** If the client sends `clientInfo` (name, version) and `protocolVersion` in the request params, they are parsed and logged at `info!`/`debug!` level for diagnostics. Missing or malformed params are accepted without error.
-- **State:** Sets `state.initialized = true`. Until this is called, `session/new` and `session/prompt` return `-32600` Invalid Request.
+- **State (stdio only):** Sets `state.initialized = true`. Until this is called on the stdio transport, `session/new`, `session/prompt`, and `session/list` return `-32600` Invalid Request. The HTTP transport does not maintain per-client initialization state (see §6.4).
 - **Response fields (schema-authoritative):**
   - `protocolVersion: 1` — integer per schema.md (ProtocolVersion type is `uint16`).
   - `agentCapabilities.loadSession: false`
@@ -139,12 +139,12 @@ No changes were required to the generic bus or agent loop; they only see standar
   - `agentCapabilities.sessionCapabilities.list: {}` — advertises `session/list` support
   - `agentInfo.name: "zeptoclaw"`, `agentInfo.version: "<crate version>"` — both required strings per schema; `agentInfo.title` is optional
   - `authMethods: []`
-- **Design:** We do not negotiate capabilities; we advertise a minimal, static set so clients know we support only the methods we implement. `initialize` may be called multiple times; each call re-sets the flag and re-logs client info.
+- **Design:** We do not negotiate capabilities; we advertise a minimal, static set so clients know we support only the methods we implement. `initialize` may be called multiple times; on stdio each call re-sets the flag and re-logs client info.
 
 ### 4.2 session/new
 
 - **Params:** `cwd` (required per schema, accepted as optional for lenient parsing), `mcpServers` (accepted but not acted on).
-- **Pre-conditions:** `is_allowed("acp_client")` must be true (else `-32000` Unauthorized); `state.initialized` must be true (else `-32600` Invalid Request); `state.sessions.len()` must be below `MAX_ACP_SESSIONS` (else `-32000` Too many sessions).
+- **Pre-conditions:** `is_allowed("acp_client")` must be true (else `-32000` Unauthorized); on the stdio transport `state.initialized` must be true (else `-32600` Invalid Request); `state.sessions.len()` must be below `MAX_ACP_SESSIONS` (else `-32000` Too many sessions).
 - **Behavior:** Generate `session_id = acp_<uuid>`, extract `cwd` from params, insert `(session_id, cwd)` into `state.sessions`, return `{ sessionId }`.
 - **Design:** Session is created and tracked in memory only; no filesystem or client callback. Sessions are never explicitly deleted — they persist for the lifetime of the process. The `cwd` is stored so `session/list` can filter by working directory. The cap of 1 000 prevents unbounded memory growth from reconnecting or misbehaving clients.
 
@@ -153,7 +153,7 @@ No changes were required to the generic bus or agent loop; they only see standar
 - **Params:** `sessionId`, `prompt` (array of content blocks).
 - **Pre-conditions (checked in order):**
   1. `is_allowed("acp_client")` — else `-32000` Unauthorized.
-  2. `state.initialized` — else `-32600` Invalid Request.
+  2. *(stdio only)* `state.initialized` — else `-32600` Invalid Request.
   3. Content extracted from text and resource_link blocks is non-empty — else `-32602` Invalid params.
   4. Content size ≤ `MAX_PROMPT_BYTES` (102 400 bytes) — else `-32602` Invalid params. Enforced before any state change so oversized payloads never reach the bus.
   5. `sessionId` is in `state.sessions` — else `-32000` Application error (not `-32602`; unknown session is a runtime condition, not an invalid-params condition).
@@ -171,7 +171,7 @@ No changes were required to the generic bus or agent loop; they only see standar
 ### 4.5 session/list
 
 - **Handler:** `handle_session_list` (stdio) / `do_session_list` (HTTP).
-- **Availability:** Only callable after `initialize` (else `-32600`). Only accessible to clients that received `sessionCapabilities.list: {}` in the `initialize` response.
+- **Availability:** On the stdio transport, only callable after `initialize` (else `-32600`). The HTTP transport does not enforce ordering. Both transports advertise `sessionCapabilities.list: {}` in the `initialize` response.
 - **Params:** `cwd` (optional string — filter sessions by working directory); `cursor` (optional — accepted but pagination is not yet implemented; `nextCursor` is always null).
 - **Behavior:** Iterate `state.sessions`. If `cwd` is provided, return only sessions whose stored cwd matches exactly. Each session is returned as a `SessionInfo` object:
   - `sessionId: String` (required)
@@ -195,7 +195,7 @@ No changes were required to the generic bus or agent loop; they only see standar
 | Code | Meaning | Triggers |
 |------|---------|---------|
 | `-32700` | Parse error | Invalid JSON on stdin |
-| `-32600` | Invalid Request | `jsonrpc` field not `"2.0"`; `session/new`, `session/prompt`, or `session/list` before `initialize` |
+| `-32600` | Invalid Request | `jsonrpc` field not `"2.0"`; on stdio: `session/new`, `session/prompt`, or `session/list` before `initialize` |
 | `-32601` | Method not found | Unrecognized method name |
 | `-32602` | Invalid params | Missing/malformed params; empty prompt; prompt too large; prompt already in flight |
 | `-32603` | Internal error | Unexpected handler failure |
@@ -288,7 +288,8 @@ Allowlist/deny is applied via `BaseChannelConfig` built from `allow_from` and `d
 
 ### 6.4 initialize-first ordering
 
-- The spec requires the client to call `initialize` before any session methods. We enforce this: `session/new` and `session/prompt` both check `state.initialized` and return `-32600` Invalid Request if it is false. `initialize` itself is always permitted.
+- The ACP spec requires the client to call `initialize` before any session methods. The **stdio transport** enforces this: `session/new`, `session/prompt`, and `session/list` all check `state.initialized` and return `-32600` Invalid Request if it is false. `initialize` itself is always permitted.
+- The **HTTP transport** does not maintain per-client initialization state. `client_id` is not part of the ACP spec, and tracking it server-side over stateless HTTP connections would require a non-spec mechanism with its own DoS surface (unbounded client set). Clients are expected to follow the protocol; the HTTP transport trusts them to do so.
 
 ---
 
@@ -378,9 +379,16 @@ The following are candidate improvements and extensions, not commitments.
 | `test_send_delivers_via_oneshot` | `send()` delivers content + cancelled=false through the oneshot channel |
 | `test_send_marks_cancelled` | `send()` propagates cancelled=true from `state.pending` |
 | `test_deny_by_default_blocks_session_new` | `deny_by_default: true` rejects `session/new` |
-| `test_constant_time_eq_*` | Auth token comparison helpers |
+| `test_constant_time_eq_*` | Auth token comparison helpers (length-constant XOR path) |
 | `test_sse_event_format` | SSE event `data:` line formatting |
 | `test_http_200_content_length` | `Content-Length` header matches body length |
+| `test_initialize_returns_spec_fields` | `initialize` response includes spec-required fields and no `clientId` |
+| `test_initialize_to_session_new_round_trip` | `initialize` → `session/new` produces a valid `sessionId` without a client token |
+| `test_initialize_to_session_new_to_session_list_round_trip` | Full three-step round-trip; `session/list` returns the created session |
+| `test_session_list_no_sessions` / `test_session_list_empty` | `session/list` returns `[]` before and after `initialize` with no sessions |
+| `test_session_list_shows_sessions_with_pending_flag` | `_meta.pending` flag reflects in-flight prompt state |
+| `test_register_prompt_blocked_without_client_id` | `register_prompt` rejects an unknown `sessionId` |
+| `test_session_cancel_*` | Notification and request forms of `session/cancel`; state and response differences |
 
 ### 9.4 Integration tests — `tests/acp_acpx.rs` (23 tests)
 

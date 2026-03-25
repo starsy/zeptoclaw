@@ -80,12 +80,6 @@ pub struct InitializeResult {
     pub agent_info: Option<AgentInfo>,
     #[serde(rename = "authMethods", default)]
     pub auth_methods: Vec<serde_json::Value>,
-    /// Opaque client identifier assigned by the server during `initialize`.
-    /// HTTP clients must echo this back as the `X-Acp-Client-Id` request
-    /// header on every subsequent call so per-client initialization state
-    /// is correctly isolated across concurrent connections.
-    #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

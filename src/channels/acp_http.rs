@@ -97,8 +97,8 @@ type PromptMap = Arc<Mutex<HashMap<String, oneshot::Sender<(String, bool)>>>>;
 
 /// Mutable per-channel ACP state shared between the accept loop and `send()`.
 struct AcpHttpState {
-    /// Session IDs → working directory (from session/new params, None if not provided).
-    sessions: HashMap<String, Option<String>>,
+    /// Session IDs → working directory (absolute path, required by ACP spec).
+    sessions: HashMap<String, String>,
     /// Tracks in-flight session/prompt requests so `send()` can retrieve the
     /// original request id and cancelled flag when the agent replies.
     pending: HashMap<String, PendingPrompt>,
@@ -332,9 +332,18 @@ impl AcpHttpChannel {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
             return Self::json_rpc_error(id, -32000, "Unauthorized");
         }
+        // ACP spec: cwd is required and MUST be an absolute path.
         let cwd = params
             .and_then(|p| serde_json::from_value::<super::acp_protocol::SessionNewParams>(p).ok())
-            .and_then(|p| p.cwd);
+            .and_then(|p| p.cwd)
+            .filter(|c| !c.is_empty());
+        let cwd = match cwd {
+            Some(c) => c,
+            None => return Self::json_rpc_error(id, -32602, "session/new: cwd is required"),
+        };
+        if !cwd.starts_with('/') {
+            return Self::json_rpc_error(id, -32602, "session/new: cwd must be an absolute path");
+        }
         let session_id = format!("acph_{}", super::acp_protocol::new_id());
         {
             let mut st = state.lock().await;
@@ -404,14 +413,14 @@ impl AcpHttpChannel {
             .iter()
             .filter(|(_, cwd)| {
                 if let Some(ref filter) = cwd_filter {
-                    cwd.as_deref() == Some(filter.as_str())
+                    cwd.as_str() == filter.as_str()
                 } else {
                     true
                 }
             })
             .map(|(sid, cwd)| SessionInfo {
                 session_id: sid.clone(),
-                cwd: cwd.clone().unwrap_or_else(|| "unknown".to_string()),
+                cwd: cwd.clone(),
                 title: None,
                 updated_at: None,
                 meta: Some(serde_json::json!({ "pending": st.pending.contains_key(sid) })),
@@ -1131,7 +1140,7 @@ mod tests {
         let session_id = "acph_test".to_string();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone(), None);
+            st.sessions.insert(session_id.clone(), "/test".to_string());
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
         }
@@ -1172,7 +1181,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<(String, bool)>();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone(), None);
+            st.sessions.insert(session_id.clone(), "/test".to_string());
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
             ch.pending_http.lock().await.insert(session_id.clone(), tx);
@@ -1199,7 +1208,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<(String, bool)>();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone(), None);
+            st.sessions.insert(session_id.clone(), "/test".to_string());
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: true });
             ch.pending_http.lock().await.insert(session_id.clone(), tx);
@@ -1240,7 +1249,7 @@ mod tests {
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(1)),
-            None,
+            Some(serde_json::json!({ "cwd": "/workspace" })),
         )
         .await;
         assert!(
@@ -1310,8 +1319,8 @@ mod tests {
         let sid_b = "acph_list_b".to_string();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(sid_a.clone(), None);
-            st.sessions.insert(sid_b.clone(), None);
+            st.sessions.insert(sid_a.clone(), "/test".to_string());
+            st.sessions.insert(sid_b.clone(), "/test".to_string());
             st.pending
                 .insert(sid_a.clone(), PendingPrompt { cancelled: false });
         }
@@ -1342,7 +1351,7 @@ mod tests {
         let session_id = "acph_notif_cancel".to_string();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone(), None);
+            st.sessions.insert(session_id.clone(), "/test".to_string());
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
         }
@@ -1383,7 +1392,7 @@ mod tests {
         let session_id = "acph_req_cancel".to_string();
         {
             let mut st = ch.state.lock().await;
-            st.sessions.insert(session_id.clone(), None);
+            st.sessions.insert(session_id.clone(), "/test".to_string());
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
         }
@@ -1461,7 +1470,7 @@ mod tests {
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(2)),
-            None,
+            Some(serde_json::json!({ "cwd": "/workspace" })),
         )
         .await;
         let new_v: serde_json::Value = serde_json::from_str(&new_body).unwrap();
@@ -1487,7 +1496,7 @@ mod tests {
             &ch.state,
             &ch.base_config,
             Some(serde_json::json!(2)),
-            None,
+            Some(serde_json::json!({ "cwd": "/workspace" })),
         )
         .await;
         let session_id = serde_json::from_str::<serde_json::Value>(&new_body).unwrap()["result"]
@@ -1515,6 +1524,68 @@ mod tests {
             sessions[0]["sessionId"].as_str().unwrap(),
             session_id,
             "listed sessionId must match the one returned by session/new"
+        );
+    }
+
+    /// `session/new` must reject requests that omit `cwd`.
+    #[tokio::test]
+    async fn test_session_new_rejects_missing_cwd() {
+        let ch = make_channel();
+        let body = AcpHttpChannel::do_session_new(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(1)),
+            None,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "missing cwd must give -32602: {body}"
+        );
+        assert!(ch.state.lock().await.sessions.is_empty());
+    }
+
+    /// `session/new` must reject a relative (non-absolute) `cwd`.
+    #[tokio::test]
+    async fn test_session_new_rejects_relative_cwd() {
+        let ch = make_channel();
+        let body = AcpHttpChannel::do_session_new(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({ "cwd": "relative/path" })),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "relative cwd must give -32602: {body}"
+        );
+        assert!(ch.state.lock().await.sessions.is_empty());
+    }
+
+    /// `session/new` must accept an absolute `cwd` and store it.
+    #[tokio::test]
+    async fn test_session_new_stores_absolute_cwd() {
+        let ch = make_channel();
+        let body = AcpHttpChannel::do_session_new(
+            &ch.state,
+            &ch.base_config,
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({ "cwd": "/home/user/project" })),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "absolute cwd must succeed: {body}"
+        );
+        let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+        let st = ch.state.lock().await;
+        assert_eq!(
+            st.sessions.get(&sid).map(|s| s.as_str()),
+            Some("/home/user/project")
         );
     }
 

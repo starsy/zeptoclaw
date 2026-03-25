@@ -15,7 +15,7 @@ ZeptoClaw implements a **minimal** ACP agent surface:
 | ACP method / message | Role | Implemented |
 |----------------------|------|--------------|
 | `initialize` | Handshake; client → agent | Yes — logs client info, returns capabilities; stdio also sets `initialized` flag |
-| `session/new` | Create session; client → agent | Yes — stores cwd; capped at 1 000 live sessions; stdio enforces prior `initialize` |
+| `session/new` | Create session; client → agent | Yes — requires absolute `cwd`; capped at 1 000 live sessions; stdio enforces prior `initialize` |
 | `session/prompt` | Send user prompt; client → agent | Yes — text and ResourceLink blocks; in-flight and size guards; stdio enforces prior `initialize` |
 | `session/cancel` | Cancel in-flight prompt; client → agent | Yes — notification; validates session existence |
 | `session/update` | Agent progress / result; agent → client | Yes — text chunks for both prompted and proactive replies |
@@ -110,7 +110,7 @@ src/channels/
 **AcpState** holds:
 
 - `initialized: bool` — set to `true` when the client calls `initialize`; `session/new` and `session/prompt` are rejected until it is true.
-- `sessions: HashMap<String, Option<String>>` — session ID → optional `cwd`. Created via `session/new`; capped at `MAX_ACP_SESSIONS` (1 000). The `cwd` is used by `session/list` for filtering.
+- `sessions: HashMap<String, String>` — session ID → `cwd` (always an absolute path, required by spec). Created via `session/new`; capped at `MAX_ACP_SESSIONS` (1 000). The `cwd` is used by `session/list` for filtering.
 - `pending: HashMap<String, PendingPrompt>` — per-session pending prompt: `request_id` and `cancelled` flag.
 
 All request handlers and `send()` share the same `AcpState` so that prompt correlation and cancellation are consistent.
@@ -143,9 +143,14 @@ No changes were required to the generic bus or agent loop; they only see standar
 
 ### 4.2 session/new
 
-- **Params:** `cwd` (required per schema, accepted as optional for lenient parsing), `mcpServers` (accepted but not acted on).
-- **Pre-conditions:** `is_allowed("acp_client")` must be true (else `-32000` Unauthorized); on the stdio transport `state.initialized` must be true (else `-32600` Invalid Request); `state.sessions.len()` must be below `MAX_ACP_SESSIONS` (else `-32000` Too many sessions).
-- **Behavior:** Generate `session_id = acp_<uuid>`, extract `cwd` from params, insert `(session_id, cwd)` into `state.sessions`, return `{ sessionId }`.
+- **Params:** `cwd` (required, must be an absolute path per spec), `mcpServers` (accepted but not acted on).
+- **Pre-conditions (checked in order):**
+  1. `is_allowed("acp_client")` — else `-32000` Unauthorized.
+  2. `cwd` is present and non-empty — else `-32602` Invalid params.
+  3. `cwd` starts with `/` (is an absolute path) — else `-32602` Invalid params.
+  4. *(stdio only)* `state.initialized` — else `-32600` Invalid Request.
+  5. `state.sessions.len()` below `MAX_ACP_SESSIONS` — else `-32000` Too many sessions.
+- **Behavior:** Generate `session_id = acp_<uuid>` (HTTP: `acph_<uuid>`), store `(session_id, cwd)` in `state.sessions`, return `{ sessionId }`.
 - **Design:** Session is created and tracked in memory only; no filesystem or client callback. Sessions are never explicitly deleted — they persist for the lifetime of the process. The `cwd` is stored so `session/list` can filter by working directory. The cap of 1 000 prevents unbounded memory growth from reconnecting or misbehaving clients.
 
 ### 4.3 session/prompt
@@ -175,7 +180,7 @@ No changes were required to the generic bus or agent loop; they only see standar
 - **Params:** `cwd` (optional string — filter sessions by working directory); `cursor` (optional — accepted but pagination is not yet implemented; `nextCursor` is always null).
 - **Behavior:** Iterate `state.sessions`. If `cwd` is provided, return only sessions whose stored cwd matches exactly. Each session is returned as a `SessionInfo` object:
   - `sessionId: String` (required)
-  - `cwd: String` (required — the cwd stored at `session/new` time, or `"unknown"` if absent)
+  - `cwd: String` (required — the absolute path stored at `session/new` time)
   - `title: null` (not implemented)
   - `updatedAt: null` (not implemented)
   - `_meta: { "pending": bool }` — non-standard extension indicating whether a prompt is in flight
@@ -387,6 +392,9 @@ The following are candidate improvements and extensions, not commitments.
 | `test_initialize_to_session_new_to_session_list_round_trip` | Full three-step round-trip; `session/list` returns the created session |
 | `test_session_list_no_sessions` / `test_session_list_empty` | `session/list` returns `[]` before and after `initialize` with no sessions |
 | `test_session_list_shows_sessions_with_pending_flag` | `_meta.pending` flag reflects in-flight prompt state |
+| `test_session_new_rejects_missing_cwd` | `session/new` without `cwd` returns `-32602` and creates no session |
+| `test_session_new_rejects_relative_cwd` | `session/new` with a relative path returns `-32602` and creates no session |
+| `test_session_new_stores_absolute_cwd` | `session/new` with an absolute path succeeds and stores `cwd` verbatim |
 | `test_register_prompt_blocked_without_client_id` | `register_prompt` rejects an unknown `sessionId` |
 | `test_session_cancel_*` | Notification and request forms of `session/cancel`; state and response differences |
 

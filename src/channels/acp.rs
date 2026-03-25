@@ -41,8 +41,8 @@ struct PendingPrompt {
 struct AcpState {
     /// Whether the client has called initialize.
     initialized: bool,
-    /// Session IDs → working directory (from session/new params, None if not provided).
-    sessions: HashMap<String, Option<String>>,
+    /// Session IDs → working directory (absolute path, required by ACP spec).
+    sessions: HashMap<String, String>,
     /// Per-session pending prompt: we respond when we get the matching outbound message.
     pending: HashMap<String, PendingPrompt>,
 }
@@ -159,9 +159,40 @@ impl AcpChannel {
             };
             return self.write_response(&response).await;
         }
+        // ACP spec: cwd is required and MUST be an absolute path.
         let cwd = params
             .and_then(|p| serde_json::from_value::<super::acp_protocol::SessionNewParams>(p).ok())
-            .and_then(|p| p.cwd);
+            .and_then(|p| p.cwd)
+            .filter(|c| !c.is_empty());
+        let cwd = match cwd {
+            Some(c) => c,
+            None => {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id,
+                    result: None,
+                    error: Some(super::acp_protocol::JsonRpcError {
+                        code: -32602,
+                        message: "session/new: cwd is required".to_string(),
+                        data: None,
+                    }),
+                };
+                return self.write_response(&response).await;
+            }
+        };
+        if !cwd.starts_with('/') {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: None,
+                error: Some(super::acp_protocol::JsonRpcError {
+                    code: -32602,
+                    message: "session/new: cwd must be an absolute path".to_string(),
+                    data: None,
+                }),
+            };
+            return self.write_response(&response).await;
+        }
         let session_id = format!("acp_{}", super::acp_protocol::new_id());
         {
             let mut state = self.state.lock().await;
@@ -492,14 +523,14 @@ impl AcpChannel {
             .iter()
             .filter(|(_, cwd)| {
                 if let Some(ref filter) = cwd_filter {
-                    cwd.as_deref() == Some(filter.as_str())
+                    cwd.as_str() == filter.as_str()
                 } else {
                     true
                 }
             })
             .map(|(sid, cwd)| SessionInfo {
                 session_id: sid.clone(),
-                cwd: cwd.clone().unwrap_or_else(|| "unknown".to_string()),
+                cwd: cwd.clone(),
                 title: None,
                 updated_at: None,
                 meta: Some(serde_json::json!({ "pending": state.pending.contains_key(sid) })),
@@ -911,7 +942,9 @@ mod tests {
         let session_id = "acp_some_session".to_string();
         {
             let mut state = channel.state.lock().await;
-            state.sessions.insert(session_id.clone(), None);
+            state
+                .sessions
+                .insert(session_id.clone(), "/test".to_string());
             state.pending.insert(
                 session_id.clone(),
                 PendingPrompt {
@@ -984,7 +1017,10 @@ mod tests {
             state.initialized = true;
         }
         let _ = channel
-            .handle_session_new(Some(serde_json::json!(1)), None)
+            .handle_session_new(
+                Some(serde_json::json!(1)),
+                Some(serde_json::json!({ "cwd": "/workspace" })),
+            )
             .await;
         let state = channel.state.lock().await;
         assert!(
@@ -1004,7 +1040,9 @@ mod tests {
         {
             let mut state = channel.state.lock().await;
             state.initialized = true;
-            state.sessions.insert(session_id.clone(), None);
+            state
+                .sessions
+                .insert(session_id.clone(), "/test".to_string());
         }
         let oversized = "a".repeat(MAX_PROMPT_BYTES + 1);
         let params = serde_json::json!({
@@ -1033,7 +1071,9 @@ mod tests {
         {
             let mut state = channel.state.lock().await;
             state.initialized = true;
-            state.sessions.insert(session_id.clone(), None);
+            state
+                .sessions
+                .insert(session_id.clone(), "/test".to_string());
             state.pending.insert(
                 session_id.clone(),
                 PendingPrompt {
@@ -1086,7 +1126,10 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let channel = AcpChannel::new(config, base, bus);
         let _ = channel
-            .handle_session_new(Some(serde_json::json!(1)), None)
+            .handle_session_new(
+                Some(serde_json::json!(1)),
+                Some(serde_json::json!({ "cwd": "/workspace" })),
+            )
             .await;
         let state = channel.state.lock().await;
         assert!(
@@ -1106,7 +1149,9 @@ mod tests {
         {
             // Seed a session directly to isolate the initialized check.
             let mut state = channel.state.lock().await;
-            state.sessions.insert(session_id.clone(), None);
+            state
+                .sessions
+                .insert(session_id.clone(), "/test".to_string());
         }
         let params = serde_json::json!({
             "sessionId": session_id,
@@ -1132,7 +1177,7 @@ mod tests {
         let known = "acp_known".to_string();
         {
             let mut state = channel.state.lock().await;
-            state.sessions.insert(known.clone(), None);
+            state.sessions.insert(known.clone(), "/test".to_string());
             state.pending.insert(
                 known.clone(),
                 PendingPrompt {
@@ -1191,7 +1236,9 @@ mod tests {
         let session_id = "acp_proactive".to_string();
         {
             let mut state = channel.state.lock().await;
-            state.sessions.insert(session_id.clone(), None);
+            state
+                .sessions
+                .insert(session_id.clone(), "/test".to_string());
         }
         let msg = OutboundMessage {
             channel: ACP_CHANNEL_NAME.to_string(),
@@ -1221,11 +1268,16 @@ mod tests {
             let mut state = channel.state.lock().await;
             state.initialized = true;
             for i in 0..MAX_ACP_SESSIONS {
-                state.sessions.insert(format!("acp_{}", i), None);
+                state
+                    .sessions
+                    .insert(format!("acp_{}", i), "/test".to_string());
             }
         }
         let _ = channel
-            .handle_session_new(Some(serde_json::json!(1)), None)
+            .handle_session_new(
+                Some(serde_json::json!(1)),
+                Some(serde_json::json!({ "cwd": "/workspace" })),
+            )
             .await;
         let state = channel.state.lock().await;
         assert_eq!(
@@ -1263,8 +1315,8 @@ mod tests {
         {
             let mut state = channel.state.lock().await;
             state.initialized = true;
-            state.sessions.insert(sid_a.clone(), None);
-            state.sessions.insert(sid_b.clone(), None);
+            state.sessions.insert(sid_a.clone(), "/test".to_string());
+            state.sessions.insert(sid_b.clone(), "/test".to_string());
             // Mark sid_a as having a prompt in flight.
             state.pending.insert(
                 sid_a.clone(),
